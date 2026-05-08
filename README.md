@@ -25,6 +25,10 @@ Run the demo (no installation needed):
 uvx --from mjlab --refresh demo
 ```
 
+The demo chooses a viewer automatically: it opens the native MuJoCo viewer when a
+local display is available, and falls back to the browser-based Viser viewer on
+headless setups.
+
 Or try in [Google Colab](https://colab.research.google.com/github/mujocolab/mjlab/blob/main/notebooks/demo.ipynb) (no local setup required).
 
 **Install from source:**
@@ -124,7 +128,7 @@ mjlab is licensed under the [Apache License, Version 2.0](LICENSE).
 
 Some portions of mjlab are forked from external projects:
 
-- **`src/mjlab/utils/lab_api/`** — Utilities forked from [NVIDIA Isaac
+- **`src/mjlab/utils/lab_api/`** — Utiulities forked from [NVIDIA Isaac
   Lab](https://github.com/isaac-sim/IsaacLab) (BSD-3-Clause license, see file
   headers)
 

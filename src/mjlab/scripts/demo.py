@@ -29,7 +29,7 @@ def main() -> None:
       checkpoint_file=checkpoint_path,
       motion_file=motion_path,
       num_envs=8,
-      viewer="viser",
+      viewer="auto",
       _demo_mode=True,
     ),
     config=mjlab.TYRO_FLAGS,
