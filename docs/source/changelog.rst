@@ -8,6 +8,15 @@ Upcoming version (not yet released)
 Added
 ^^^^^
 
+- Added a soccer ball and dribbling objective to the
+  ``Mjlab-Soccer-Unitree-G1`` task. A FIFA size-5 ball
+  (``SoccerBallCfg``/``get_soccer_ball_spec`` in
+  ``mjlab.terrains.soccer_field``) is added as a movable entity, and a new
+  ``DribbleCommand`` drives an end-to-end policy that walks to the ball and
+  dribbles it to a random target point on the field. The command derives a
+  base-frame twist consumed by the inherited gait rewards, so walking/balance
+  shaping is reused unchanged while dribble approach/bring/velocity/success
+  rewards layer on top.
 - Added ``--log-root`` CLI option to ``train``, ``play``, and ``evaluate``
   scripts for choosing where training logs are stored. Defaults to
   ``logs/rsl_rl`` (unchanged behavior). Useful for directing outputs to a

@@ -45,6 +45,52 @@ _LINE_HALF_Z = 0.0025
 
 
 @dataclass(kw_only=True)
+class SoccerBallCfg:
+  """FIFA size-5 / RoboCup MSL soccer ball (meters, kg).
+
+  A floating, collidable sphere. Spawned as a standalone entity with its own
+  freejoint (see ``get_soccer_ball_spec``) so the robot's feet can push it and
+  it can be repositioned per-env on reset.
+  """
+
+  radius: float = 0.11  # Diameter 0.22 m.
+  mass: float = 0.43
+  rgba: tuple[float, float, float, float] = (1.0, 0.4, 0.0, 1.0)  # High-contrast.
+  # MuJoCo geom friction (slide, spin, roll). Low spin/roll keeps it rolling.
+  friction: tuple[float, float, float] = (0.5, 0.02, 0.01)
+  solref: tuple[float, float] = (0.02, 1.0)
+  # solimp: (dmin, dmax, width, midpoint, power) — MuJoCo expects 5 values.
+  solimp: tuple[float, float, float, float, float] = (0.9, 0.95, 0.001, 0.5, 2.0)
+
+
+def get_soccer_ball_spec(cfg: SoccerBallCfg | None = None) -> mujoco.MjSpec:
+  """Build a standalone ``MjSpec`` for a soccer ball entity.
+
+  Intended for use as an ``EntityCfg.spec_fn``. The ball is a single collidable
+  sphere on a freejoint. Render group is left at 0 so it participates in
+  collisions; the field carpet/lines live in group 2 and are collision-free.
+  """
+  if cfg is None:
+    cfg = SoccerBallCfg()
+
+  spec = mujoco.MjSpec()
+  body = spec.worldbody.add_body(name="ball", pos=(0.0, 0.0, cfg.radius))
+  body.add_freejoint(name="ball_joint")
+  body.add_geom(
+    type=mujoco.mjtGeom.mjGEOM_SPHERE,
+    size=(cfg.radius, 0.0, 0.0),
+    mass=cfg.mass,
+    rgba=cfg.rgba,
+    condim=3,
+    friction=cfg.friction,
+    solref=cfg.solref,
+    solimp=cfg.solimp,
+    name="ball_geom",
+  )
+  return spec
+
+
+@dataclass(kw_only=True)
 class SoccerFieldCfg:
   """Mid-size robot soccer field dimensions (meters).
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import torch
@@ -10,6 +10,7 @@ from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import BuiltinSensor, ContactSensor
 from mjlab.sensor.terrain_height_sensor import TerrainHeightSensor
+from mjlab.tasks.velocity.mdp.dribble_command import DribbleCommand
 from mjlab.tasks.velocity.mdp.terrain_utils import terrain_normal_from_sensors
 from mjlab.utils.lab_api.math import quat_apply, quat_apply_inverse
 from mjlab.utils.lab_api.string import (
@@ -464,3 +465,59 @@ class variable_posture:
     error_squared = torch.square(current_joint_pos - desired_joint_pos)
 
     return torch.exp(-torch.mean(error_squared / (std**2), dim=1))
+
+
+def _dribble_cmd(env: ManagerBasedRlEnv, command_name: str) -> DribbleCommand:
+  return cast(DribbleCommand, env.command_manager.get_term(command_name))
+
+
+def dribble_approach(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  std: float,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Dense reward for the robot getting close to the ball (ground-plane xy)."""
+  asset: Entity = env.scene[asset_cfg.name]
+  command = _dribble_cmd(env, command_name)
+  robot_xy = asset.data.root_link_pos_w[:, :2]
+  ball_xy = command.ball_pos_w[:, :2]
+  error = torch.sum(torch.square(robot_xy - ball_xy), dim=-1)
+  return torch.exp(-error / std**2)
+
+
+def dribble_ball_to_target(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  std: float,
+) -> torch.Tensor:
+  """Dominant task reward: ball close to the target (ground-plane xy)."""
+  command = _dribble_cmd(env, command_name)
+  ball_xy = command.ball_pos_w[:, :2]
+  target_xy = command.target_pos[:, :2]
+  error = torch.sum(torch.square(target_xy - ball_xy), dim=-1)
+  return torch.exp(-error / std**2)
+
+
+def dribble_ball_velocity_to_target(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+) -> torch.Tensor:
+  """Reward ball velocity projected onto the ball->target direction (>=0)."""
+  command = _dribble_cmd(env, command_name)
+  ball_xy = command.ball_pos_w[:, :2]
+  target_xy = command.target_pos[:, :2]
+  ball_vel_xy = command.ball_lin_vel_w[:, :2]
+  to_target = target_xy - ball_xy
+  dir_to_target = to_target / (torch.norm(to_target, dim=-1, keepdim=True) + 1e-6)
+  projected = torch.sum(ball_vel_xy * dir_to_target, dim=-1)
+  return projected.clamp_min(0.0)
+
+
+def dribble_success_bonus(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+) -> torch.Tensor:
+  """Sparse bonus while the ball is within the success threshold of the target."""
+  command = _dribble_cmd(env, command_name)
+  return command.metrics["at_goal"]

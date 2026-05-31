@@ -4,11 +4,14 @@ from mjlab.asset_zoo.robots import (
   G1_ACTION_SCALE,
   get_g1_robot_cfg,
 )
+from mjlab.entity import EntityCfg
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs import mdp as envs_mdp
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.event_manager import EventTermCfg
+from mjlab.managers.observation_manager import ObservationTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
+from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.sensor import (
   ContactMatch,
@@ -20,8 +23,14 @@ from mjlab.sensor import (
 )
 from mjlab.tasks.velocity import mdp
 from mjlab.tasks.velocity.mdp import UniformVelocityCommandCfg
+from mjlab.tasks.velocity.mdp.dribble_command import DribbleCommandCfg
 from mjlab.tasks.velocity.velocity_env_cfg import make_velocity_env_cfg
-from mjlab.terrains.soccer_field import SoccerFieldCfg, build_soccer_field
+from mjlab.terrains.soccer_field import (
+  SoccerBallCfg,
+  SoccerFieldCfg,
+  build_soccer_field,
+  get_soccer_ball_spec,
+)
 
 
 def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
@@ -223,19 +232,34 @@ def unitree_g1_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
 
 def unitree_g1_soccer_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
-  """Create Unitree G1 soccer-field velocity configuration.
+  """Create Unitree G1 soccer-field dribbling configuration.
 
   A mid-size robot soccer field (22 x 14 m) is painted onto a flat ground plane
-  via ``SceneCfg.spec_fn``. The robot tracks velocity commands while a soft
-  boundary truncates the episode if it leaves the field, so it learns to stay
-  within the side/goal lines.
+  via ``SceneCfg.spec_fn``, and a FIFA size-5 ball is added as a movable entity.
+  The end-to-end policy learns to walk to the ball and dribble it to a random
+  target point. The ``DribbleCommand`` owns the ball/target state and derives a
+  base-frame twist that the inherited gait rewards consume unchanged, so all
+  walking/balance shaping keeps working while the dribble rewards layer on top.
+  A soft boundary truncates the episode if the robot leaves the field.
   """
   cfg = unitree_g1_flat_env_cfg(play=play)
 
   field_cfg = SoccerFieldCfg()
+  ball_cfg = SoccerBallCfg()
 
   # Paint the field into the scene right before compilation.
   cfg.scene.spec_fn = lambda spec: build_soccer_field(spec, field_cfg)
+
+  # Add the ball as a standalone movable entity (own MjSpec + freejoint), not
+  # painted into the shared field worldbody, so it can be reset per-env.
+  assert cfg.scene.entities is not None
+  cfg.scene.entities = {
+    **cfg.scene.entities,
+    "ball": EntityCfg(
+      spec_fn=lambda: get_soccer_ball_spec(ball_cfg),
+      init_state=EntityCfg.InitialStateCfg(pos=(0.0, 0.0, ball_cfg.radius)),
+    ),
+  }
 
   # All parallel worlds share one field at the origin, so spawn every robot at
   # the field center (env_spacing=0) and scatter within the field via the reset
@@ -254,6 +278,71 @@ def unitree_g1_soccer_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     "z": (0.01, 0.05),
     "yaw": (-3.14, 3.14),
   }
+
+  # Replace the random velocity command with the dribble command. It resamples
+  # only at reset (large resampling time) so the ball never teleports mid-dribble.
+  cfg.commands = {
+    "dribble": DribbleCommandCfg(
+      entity_name="ball",
+      robot_name="robot",
+      resampling_time_range=(1.0e6, 1.0e6),
+      debug_vis=True,
+      ball_radius=ball_cfg.radius,
+      half_length=field_cfg.half_length,
+      half_width=field_cfg.half_width,
+    ),
+  }
+
+  # Repoint every gait reward/observation that gated on the old "twist" command
+  # to the derived "dribble" twist.
+  for reward in cfg.rewards.values():
+    if reward.params.get("command_name") == "twist":
+      reward.params["command_name"] = "dribble"
+  for group in ("actor", "critic"):
+    cmd_term = cfg.observations[group].terms.get("command")
+    if cmd_term is not None:
+      cmd_term.params["command_name"] = "dribble"
+
+  # Add ball/target observations to both groups (base-frame relative vectors).
+  for group in ("actor", "critic"):
+    terms = cfg.observations[group].terms
+    terms["robot_to_ball"] = ObservationTermCfg(
+      func=mdp.robot_to_ball,
+      params={"command_name": "dribble", "asset_cfg": SceneEntityCfg("robot")},
+    )
+    terms["ball_to_target"] = ObservationTermCfg(
+      func=mdp.ball_to_target,
+      params={"command_name": "dribble", "asset_cfg": SceneEntityCfg("robot")},
+    )
+    terms["ball_velocity"] = ObservationTermCfg(
+      func=mdp.ball_velocity_b,
+      params={"command_name": "dribble", "asset_cfg": SceneEntityCfg("robot")},
+    )
+
+  # Dribble task rewards (layered on top of the inherited gait rewards).
+  cfg.rewards["dribble_approach"] = RewardTermCfg(
+    func=mdp.dribble_approach,
+    weight=1.0,
+    params={"command_name": "dribble", "std": 1.0},
+  )
+  cfg.rewards["dribble_to_target"] = RewardTermCfg(
+    func=mdp.dribble_ball_to_target,
+    weight=3.0,
+    params={"command_name": "dribble", "std": 2.0},
+  )
+  cfg.rewards["dribble_ball_velocity"] = RewardTermCfg(
+    func=mdp.dribble_ball_velocity_to_target,
+    weight=0.5,
+    params={"command_name": "dribble"},
+  )
+  cfg.rewards["dribble_success"] = RewardTermCfg(
+    func=mdp.dribble_success_bonus,
+    weight=5.0,
+    params={"command_name": "dribble"},
+  )
+
+  # The velocity-range curriculum mutated the now-removed "twist" command.
+  cfg.curriculum.pop("command_vel", None)
 
   # Soft field boundary (truncation, not penalized).
   cfg.terminations["out_of_field_bounds"] = TerminationTermCfg(
