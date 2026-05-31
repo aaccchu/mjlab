@@ -9,6 +9,7 @@ from mjlab.envs import mdp as envs_mdp
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
+from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.sensor import (
   ContactMatch,
   ContactSensorCfg,
@@ -20,6 +21,7 @@ from mjlab.sensor import (
 from mjlab.tasks.velocity import mdp
 from mjlab.tasks.velocity.mdp import UniformVelocityCommandCfg
 from mjlab.tasks.velocity.velocity_env_cfg import make_velocity_env_cfg
+from mjlab.terrains.soccer_field import SoccerFieldCfg, build_soccer_field
 
 
 def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
@@ -216,5 +218,52 @@ def unitree_g1_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     assert isinstance(twist_cmd, UniformVelocityCommandCfg)
     twist_cmd.ranges.lin_vel_x = (-1.5, 2.0)
     twist_cmd.ranges.ang_vel_z = (-0.7, 0.7)
+
+  return cfg
+
+
+def unitree_g1_soccer_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """Create Unitree G1 soccer-field velocity configuration.
+
+  A mid-size robot soccer field (22 x 14 m) is painted onto a flat ground plane
+  via ``SceneCfg.spec_fn``. The robot tracks velocity commands while a soft
+  boundary truncates the episode if it leaves the field, so it learns to stay
+  within the side/goal lines.
+  """
+  cfg = unitree_g1_flat_env_cfg(play=play)
+
+  field_cfg = SoccerFieldCfg()
+
+  # Paint the field into the scene right before compilation.
+  cfg.scene.spec_fn = lambda spec: build_soccer_field(spec, field_cfg)
+
+  # All parallel worlds share one field at the origin, so spawn every robot at
+  # the field center (env_spacing=0) and scatter within the field via the reset
+  # pose range. Without this, grid-spaced origins would place robots far outside
+  # the field and trip the soft boundary on every reset.
+  cfg.scene.env_spacing = 0.0
+  assert cfg.scene.terrain is not None
+  cfg.scene.terrain.env_spacing = 0.0
+
+  # Scatter spawns inside the field (well within the lines), random heading.
+  spawn_x = field_cfg.half_length - 2.0
+  spawn_y = field_cfg.half_width - 2.0
+  cfg.events["reset_base"].params["pose_range"] = {
+    "x": (-spawn_x, spawn_x),
+    "y": (-spawn_y, spawn_y),
+    "z": (0.01, 0.05),
+    "yaw": (-3.14, 3.14),
+  }
+
+  # Soft field boundary (truncation, not penalized).
+  cfg.terminations["out_of_field_bounds"] = TerminationTermCfg(
+    func=mdp.out_of_field_bounds,
+    time_out=True,
+    params={
+      "half_length": field_cfg.half_length,
+      "half_width": field_cfg.half_width,
+      "margin": 0.3,
+    },
+  )
 
   return cfg

@@ -68,6 +68,27 @@ def out_of_terrain_bounds(
   return (root_xy_w[:, 0].abs() > limit_x) | (root_xy_w[:, 1].abs() > limit_y)
 
 
+def out_of_field_bounds(
+  env: ManagerBasedRlEnv,
+  half_length: float = 11.0,
+  half_width: float = 7.0,
+  margin: float = 0.3,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Truncate if the robot leaves a fixed rectangular field footprint.
+
+  Soft boundary for the soccer-field task: the field spans
+  ``x in [-half_length, half_length]`` and ``y in [-half_width, half_width]``
+  (outer-edge basis). The robot is truncated when its root link crosses the
+  bound shrunk by ``margin``, so it learns to stay inside the side/goal lines.
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+  root_xy_w = asset.data.root_link_pos_w[:, :2]
+  limit_x = max(0.0, half_length - margin)
+  limit_y = max(0.0, half_width - margin)
+  return (root_xy_w[:, 0].abs() > limit_x) | (root_xy_w[:, 1].abs() > limit_y)
+
+
 def terrain_edge_reached(
   env: ManagerBasedRlEnv,
   threshold_fraction: float = 0.95,
