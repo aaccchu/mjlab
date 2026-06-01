@@ -1,0 +1,7 @@
+metric,mean,ci_low,ci_high
+success_rate,0.998047,0.994219,1.001875
+fall_rate,0.001953,-0.001875,0.005781
+possession_rate,0.958575,0.955285,0.961865
+ball_to_target_error,0.199173,0.191188,0.207158
+time_to_goal,121.502935,119.605415,123.400456
+n_episodes,512,,

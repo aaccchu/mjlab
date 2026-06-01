@@ -53,6 +53,7 @@ def run_evaluate(cfg: EvalConfig) -> dict[str, float]:
   env_cfg.scene.num_envs = cfg.num_envs
   env_cfg.observations["actor"].enable_corruption = False
   env_cfg.events.pop("push_robot", None)
+  env_cfg.auto_reset = False
 
   env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
   env.seed(cfg.seed)
@@ -81,6 +82,7 @@ def run_evaluate(cfg: EvalConfig) -> dict[str, float]:
   completed = 0
 
   obs = env.get_observations()
+  raw_env = env.unwrapped
 
   while completed < cfg.max_episodes:
     with torch.no_grad():
@@ -111,9 +113,13 @@ def run_evaluate(cfg: EvalConfig) -> dict[str, float]:
       if sc > 0:
         possessions.append(poss / sc)
 
-      tm = env.unwrapped.termination_manager
+      tm = raw_env.termination_manager
       fell = bool(tm.terminated[i]) and not bool(tm.time_outs[i])
       falls.append(float(fell))
+
+    raw_env.reset(env_ids=done_ids)
+    reset_obs = raw_env.observation_manager.compute()
+    obs["actor"][done_ids] = reset_obs["actor"][done_ids]  # type: ignore[index]
 
   env.close()
 
