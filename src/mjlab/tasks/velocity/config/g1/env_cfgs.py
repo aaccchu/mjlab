@@ -269,6 +269,23 @@ def unitree_g1_soccer_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   assert cfg.scene.terrain is not None
   cfg.scene.terrain.env_spacing = 0.0
 
+  # Foot↔ball contact sensor (for kick reward, not added to observations).
+  foot_ball_cfg = ContactSensorCfg(
+    name="foot_ball_contact",
+    primary=ContactMatch(
+      mode="subtree",
+      pattern=r"^(left_ankle_roll_link|right_ankle_roll_link)$",
+      entity="robot",
+    ),
+    secondary=ContactMatch(mode="geom", pattern="ball_geom", entity="ball"),
+    fields=("found", "force"),
+    reduce="netforce",
+    num_slots=1,
+  )
+  cfg.scene.sensors = (cfg.scene.sensors or ()) + (foot_ball_cfg,)
+  cfg.sim.nconmax = 100
+  cfg.sim.contact_sensor_maxmatch = 128
+
   # Scatter spawns inside the field (well within the lines), random heading.
   spawn_x = field_cfg.half_length - 2.0
   spawn_y = field_cfg.half_width - 2.0
@@ -339,6 +356,11 @@ def unitree_g1_soccer_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     func=mdp.dribble_success_bonus,
     weight=5.0,
     params={"command_name": "dribble"},
+  )
+  cfg.rewards["kick_contact"] = RewardTermCfg(
+    func=mdp.dribble_kick_contact,
+    weight=0.3,
+    params={"sensor_name": "foot_ball_contact", "command_name": "dribble"},
   )
 
   # The velocity-range curriculum mutated the now-removed "twist" command.

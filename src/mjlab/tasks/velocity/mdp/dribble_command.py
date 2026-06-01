@@ -51,6 +51,11 @@ class DribbleCommand(CommandTerm):
     self.metrics["robot_to_ball_error"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["at_goal"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["episode_success"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["time_to_goal"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["possession"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["ball_path_length"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["step_count"] = torch.zeros(self.num_envs, device=self.device)
+    self._prev_ball_xy = torch.zeros(self.num_envs, 2, device=self.device)
 
   @property
   def command(self) -> torch.Tensor:
@@ -78,6 +83,16 @@ class DribbleCommand(CommandTerm):
     self.metrics["at_goal"] = at_goal
     self.metrics["episode_success"] = self.episode_success
 
+    self.metrics["step_count"] += 1.0
+    first_success = (at_goal > 0) & (self.metrics["time_to_goal"] == 0)
+    self.metrics["time_to_goal"] = torch.where(
+      first_success, self.metrics["step_count"], self.metrics["time_to_goal"]
+    )
+    self.metrics["possession"] += (robot_to_ball < 0.5).float()
+    ball_disp = torch.norm(ball_xy - self._prev_ball_xy, dim=-1)
+    self.metrics["ball_path_length"] += ball_disp
+    self._prev_ball_xy = ball_xy.clone()
+
   def compute_success(self) -> torch.Tensor:
     return self.metrics["ball_to_target_error"] < self.cfg.success_threshold
 
@@ -93,6 +108,10 @@ class DribbleCommand(CommandTerm):
     n = len(env_ids)
     self.episode_success[env_ids] = 0.0
     self.vel_command_b[env_ids] = 0.0
+    self.metrics["time_to_goal"][env_ids] = 0.0
+    self.metrics["possession"][env_ids] = 0.0
+    self.metrics["ball_path_length"][env_ids] = 0.0
+    self.metrics["step_count"][env_ids] = 0.0
 
     # Robot spawn pose lives in fresh qpos at reset time; xpos (root_link_pos_w)
     # is still stale here because no sim.forward() runs between the reset event
@@ -141,6 +160,7 @@ class DribbleCommand(CommandTerm):
     self.object.write_root_link_velocity_to_sim(
       torch.zeros(n, 6, device=self.device), env_ids=env_ids
     )
+    self._prev_ball_xy[env_ids] = ball_xy
 
   def _update_command(self) -> None:
     # Runs each step after sim.forward(), so xpos-derived reads are fresh.

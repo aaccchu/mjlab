@@ -521,3 +521,15 @@ def dribble_success_bonus(
   """Sparse bonus while the ball is within the success threshold of the target."""
   command = _dribble_cmd(env, command_name)
   return command.metrics["at_goal"]
+
+
+def dribble_kick_contact(
+  env: ManagerBasedRlEnv,
+  sensor_name: str,
+  command_name: str,
+) -> torch.Tensor:
+  """Reward for foot-ball contact (encourage using feet to hit ball)."""
+  contact_sensor: ContactSensor = env.scene[sensor_name]
+  data = contact_sensor.data
+  assert data.found is not None
+  return (data.found.sum(dim=-1) > 0).float()
