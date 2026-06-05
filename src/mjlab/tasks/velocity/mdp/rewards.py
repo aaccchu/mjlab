@@ -11,6 +11,7 @@ from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import BuiltinSensor, ContactSensor
 from mjlab.sensor.terrain_height_sensor import TerrainHeightSensor
 from mjlab.tasks.velocity.mdp.dribble_command import DribbleCommand
+from mjlab.tasks.velocity.mdp.observations import _gaze_uv_visible
 from mjlab.tasks.velocity.mdp.terrain_utils import terrain_normal_from_sensors
 from mjlab.utils.lab_api.math import quat_apply, quat_apply_inverse
 from mjlab.utils.lab_api.string import (
@@ -533,3 +534,210 @@ def dribble_kick_contact(
   data = contact_sensor.data
   assert data.found is not None
   return (data.found.sum(dim=-1) > 0).float()
+
+
+def gaze_at_ball(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  std: float = 2.0,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Reward waist_yaw aligning with ball bearing in body frame.
+
+  Encourages the robot to rotate its torso toward the ball via waist_yaw,
+  which would point a head-mounted camera at the ball.
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+  command = _dribble_cmd(env, command_name)
+  vec_w = command.ball_pos_w - asset.data.root_link_pos_w
+  ball_b = quat_apply_inverse(asset.data.root_link_quat_w, vec_w)
+  ball_bearing = torch.atan2(ball_b[:, 1], ball_b[:, 0])
+  waist_yaw = asset.data.joint_pos[:, asset_cfg.joint_ids][:, 0]
+  angle_error = torch.abs(waist_yaw - ball_bearing)
+  return torch.exp(-std * angle_error)
+
+
+def goal_scored_bonus(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+) -> torch.Tensor:
+  """Sparse one-shot reward at the step the ball crosses into the goal mouth."""
+  command = _dribble_cmd(env, command_name)
+  return command.newly_scored
+
+
+def goal_progress(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+) -> torch.Tensor:
+  """Dense reward: ball velocity projected onto the ball->goal-line direction.
+
+  Drives the ball toward the +x goal mouth. Unlike dribble_ball_velocity (which
+  targets an arbitrary point), this always points goalward so the policy learns
+  to shoot/dribble toward the goal.
+  """
+  command = _dribble_cmd(env, command_name)
+  ball_xy = command.ball_pos_w[:, :2]
+  ball_vel_xy = command.ball_lin_vel_w[:, :2]
+  center_xy = env.scene.env_origins[:, :2]
+  # Goal aim point: goal line in +x at the ball's current y (clamped to mouth).
+  goal_x = center_xy[:, 0] + command.cfg.goal_line_x - command.cfg.field_margin
+  goal_y = center_xy[:, 1] + torch.clamp(
+    ball_xy[:, 1] - center_xy[:, 1],
+    -command.cfg.goal_half_width,
+    command.cfg.goal_half_width,
+  )
+  goal_xy = torch.stack([goal_x, goal_y], dim=-1)
+  to_goal = goal_xy - ball_xy
+  dir_to_goal = to_goal / (torch.norm(to_goal, dim=-1, keepdim=True) + 1e-6)
+  projected = torch.sum(ball_vel_xy * dir_to_goal, dim=-1)
+  return projected.clamp_min(0.0)
+
+
+def approach_delta(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Reward = reduction in distance to ball since last step.
+
+  Provides constant-magnitude gradient signal at any distance, unlike
+  exp(-dist²) which vanishes beyond a few meters.
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+  command = _dribble_cmd(env, command_name)
+  robot_xy = asset.data.root_link_pos_w[:, :2]
+  ball_xy = command.ball_pos_w[:, :2]
+  dist = torch.norm(robot_xy - ball_xy, dim=-1)
+  delta = command._prev_robot_to_ball_dist - dist
+  command._prev_robot_to_ball_dist = dist.clone()
+  return delta
+
+
+def heading_to_ball(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Reward for robot heading pointing toward the ball (cosine similarity)."""
+  asset: Entity = env.scene[asset_cfg.name]
+  command = _dribble_cmd(env, command_name)
+  vec_w = command.ball_pos_w[:, :2] - asset.data.root_link_pos_w[:, :2]
+  dist = torch.norm(vec_w, dim=-1, keepdim=True).clamp(min=1e-3)
+  dir_to_ball = vec_w / dist
+  forward_w = quat_apply(
+    asset.data.root_link_quat_w,
+    torch.tensor([[1.0, 0.0, 0.0]], device=asset.data.root_link_quat_w.device).expand(
+      asset.data.root_link_quat_w.shape[0], -1
+    ),
+  )[:, :2]
+  return (forward_w * dir_to_ball).sum(dim=-1).clamp(min=0.0)
+
+
+# --- Spike A2-MOS92: vision-centered gaze + search/track behavior ----------
+
+
+def gaze_center(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  std: float = 0.5,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Reward keeping the ball near image center, only while it is visible.
+
+  Drives both neck_yaw (u) and neck_pitch (v) so the ball stays centered in
+  the head camera. Zero when the ball is out of view (search handles that).
+  """
+  u, v, visible = _gaze_uv_visible(env, command_name, asset_cfg)
+  centered = torch.exp(-(u**2 + v**2) / (std**2))
+  return visible * centered
+
+
+def gaze_search(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Reward turning the gaze toward the ball bearing while it is NOT visible.
+
+  Encourages scanning toward where the ball actually is (last-known/true
+  bearing) rather than spinning randomly. Active only when out of view, so it
+  rewards reducing the gaze-to-ball angle until the ball enters the frame.
+  """
+  u, v, visible = _gaze_uv_visible(env, command_name, asset_cfg)
+  # |u| is the horizontal gaze error in half-FoV units; reward shrinking it.
+  align = torch.exp(-(u.abs() - 1.0).clamp(min=0.0))
+  return (1.0 - visible) * align
+
+
+def search_freeze(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Penalty (>=0, used with negative weight) on base linear speed while the
+  ball is out of view.
+
+  Implements stage-1 search "don't walk before you see the ball": when the
+  ball is not visible, any base translation is penalized. In-place yaw is NOT
+  penalized, so the policy can still turn the body to cover the rear blind
+  sector (stage-2 search).
+  """
+  robot: Entity = env.scene[asset_cfg.name]
+  _, _, visible = _gaze_uv_visible(env, command_name, asset_cfg)
+  base_speed = torch.norm(robot.data.root_link_lin_vel_w[:, :2], dim=-1)
+  return (1.0 - visible) * base_speed
+
+
+def approach_intercept(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  tau: float = 0.5,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Reward reducing distance to the ball's predicted intercept point, only
+  while the ball is visible.
+
+  Predicted point = ball_pos + ball_vel * tau, so the robot leads a rolling
+  ball instead of chasing its current position. Gated by visibility so the
+  robot approaches only after it has found the ball.
+  """
+  robot: Entity = env.scene[asset_cfg.name]
+  command = _dribble_cmd(env, command_name)
+  _, _, visible = _gaze_uv_visible(env, command_name, asset_cfg)
+  predicted = command.ball_pos_w[:, :2] + tau * command.ball_lin_vel_w[:, :2]
+  robot_xy = robot.data.root_link_pos_w[:, :2]
+  dist = torch.norm(robot_xy - predicted, dim=-1)
+  delta = command._prev_intercept_dist - dist
+  command._prev_intercept_dist = dist.clone()
+  return visible * delta
+
+
+def flight_phase(
+  env: ManagerBasedRlEnv,
+  sensor_name: str,
+  air_time_threshold: float = 0.0,
+) -> torch.Tensor:
+  """Penalize a flight phase: BOTH feet off the ground simultaneously.
+
+  A bipedal walking/dribbling gait always keeps at least one foot in contact
+  (single- or double-support). A flight phase only appears when the robot hops
+  or jumps — e.g. to reorient by jumping instead of stepping. Returns a per-env
+  cost in [0, 1] = fraction-of-feet-aware indicator that both feet are airborne;
+  use with a negative weight.
+
+  Args:
+    sensor_name: feet ground-contact sensor (``found`` field, ``[B, n_feet]``).
+    air_time_threshold: only count it as flight once both feet have been airborne
+      for at least this long (s). 0.0 = penalize any both-feet-off step; a small
+      value (~0.05) ignores the brief double-float of a fast gait transition.
+  """
+  sensor: ContactSensor = env.scene[sensor_name]
+  assert sensor.data.found is not None
+  airborne = sensor.data.found == 0  # [B, n_feet] True where that foot is off.
+  if air_time_threshold > 0.0:
+    assert sensor.data.current_air_time is not None
+    airborne = airborne & (sensor.data.current_air_time > air_time_threshold)
+  in_flight = airborne.all(dim=1).float()  # [B] 1.0 when ALL feet off.
+  env.extras["log"]["Metrics/flight_phase_frac"] = in_flight.mean()
+  return in_flight

@@ -1,0 +1,1 @@
+controller_joint_names: ['', 'b_n', 'n_h', 'b_Rs', 'Rs_Ra', 'Ra_Rh', 'b_Ls', 'Ls_La', 'La_Lh', 'b_Rh', 'Rh_Rl', 'Rl_Rl1', 'Rl1_Rl2', 'Rl2_Ra', 'Ra_Rf', 'b_Lh', 'Lh_Ll', 'Ll_Ll1', 'Ll1_Ll2', 'Ll2_La', 'La_Lf', ]

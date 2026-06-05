@@ -22,6 +22,41 @@ class VelocityStage(TypedDict):
   ang_vel_z: tuple[float, float] | None
 
 
+def mask_obs_scale(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor,
+  group_name: str,
+  term_names: list[str],
+  start_step: int,
+  end_step: int,
+) -> dict[str, torch.Tensor]:
+  """Linearly ramp the ``scale`` of obs terms from 1.0 to 0.0 over a step window.
+
+  Used for vision GT-ablation: holding scale=1.0 before ``start_step`` keeps the
+  bootstrapped behavior stable, ramping 1->0 between start/end steps progressively
+  starves the listed GT terms (avoiding the input-shock collapse a hard drop
+  causes), and scale=0 after ``end_step`` zeroes them entirely while leaving the
+  obs DIMENSION unchanged (so the checkpoint loads strict). The obs manager reads
+  ``term_cfg.scale`` live each compute, and ``get_term_cfg`` returns the same cfg
+  object the manager iterates, so mutating ``.scale`` here takes effect next step.
+
+  ``step`` is ``env.common_step_counter`` (= iteration * num_steps_per_env).
+  """
+  del env_ids  # Global scale, not per-env.
+  step = env.common_step_counter
+  if step <= start_step:
+    factor = 1.0
+  elif step >= end_step:
+    factor = 0.0
+  else:
+    factor = 1.0 - (step - start_step) / float(end_step - start_step)
+  scale_t = torch.tensor(factor, dtype=torch.float, device=env.device)
+  for term_name in term_names:
+    term_cfg = env.observation_manager.get_term_cfg(group_name, term_name)
+    term_cfg.scale = scale_t
+  return {"mask_factor": torch.tensor(factor)}
+
+
 def terrain_levels_vel(
   env: ManagerBasedRlEnv,
   env_ids: torch.Tensor,

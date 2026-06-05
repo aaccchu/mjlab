@@ -56,6 +56,15 @@ class DribbleCommand(CommandTerm):
     self.metrics["ball_path_length"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["step_count"] = torch.zeros(self.num_envs, device=self.device)
     self._prev_ball_xy = torch.zeros(self.num_envs, 2, device=self.device)
+    self._prev_robot_to_ball_dist = torch.zeros(self.num_envs, device=self.device)
+    # Spike A2: previous robot->predicted-intercept distance (approach reward).
+    self._prev_intercept_dist = torch.zeros(self.num_envs, device=self.device)
+
+    # Goal-scoring (Spike E): per-episode latch + metric.
+    self.goal_scored = torch.zeros(self.num_envs, device=self.device)
+    # Step-level 0->1 transition signal for the sparse goal reward.
+    self.newly_scored = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["goal_rate"] = torch.zeros(self.num_envs, device=self.device)
 
   @property
   def command(self) -> torch.Tensor:
@@ -93,6 +102,23 @@ class DribbleCommand(CommandTerm):
     self.metrics["ball_path_length"] += ball_disp
     self._prev_ball_xy = ball_xy.clone()
 
+    # Spike E: goal-scoring latch. Ball must cross the +x goal line within the
+    # mouth opening. Coordinates are env-local (subtract env origin). The goal
+    # line sits at goal_line_x; accept a small band inward so a ball resting on
+    # the line still counts, and bound it outward by the net depth.
+    center_xy = self._env.scene.env_origins[:, :2]
+    ball_local = ball_xy - center_xy
+    in_goal = (
+      (ball_local[:, 0] > self.cfg.goal_line_x - 0.2)
+      & (ball_local[:, 0] < self.cfg.goal_line_x + 0.6)
+      & (ball_local[:, 1].abs() < self.cfg.goal_half_width)
+    )
+    in_goal_f = in_goal.float()
+    # 0->1 transition only: reward the scoring event once per episode.
+    self.newly_scored = (in_goal_f * (1.0 - self.goal_scored)).clamp_min(0.0)
+    self.goal_scored = torch.maximum(self.goal_scored, in_goal_f)
+    self.metrics["goal_rate"] = self.goal_scored
+
   def compute_success(self) -> torch.Tensor:
     return self.metrics["ball_to_target_error"] < self.cfg.success_threshold
 
@@ -107,6 +133,7 @@ class DribbleCommand(CommandTerm):
   def _resample_command(self, env_ids: torch.Tensor) -> None:
     n = len(env_ids)
     self.episode_success[env_ids] = 0.0
+    self.goal_scored[env_ids] = 0.0
     self.vel_command_b[env_ids] = 0.0
     self.metrics["time_to_goal"][env_ids] = 0.0
     self.metrics["possession"][env_ids] = 0.0
@@ -118,12 +145,40 @@ class DribbleCommand(CommandTerm):
     # and command resampling. Read the freejoint qpos directly.
     q_adr = self.robot.data.indexing.free_joint_q_adr
     robot_xy = self.robot.data.data.qpos[:, q_adr[:3]][env_ids][:, :2]
+    # Robot heading (yaw) from the freejoint quaternion (w, x, y, z).
+    robot_quat = self.robot.data.data.qpos[:, q_adr[3:7]][env_ids]
+    qw, qx, qy, qz = (
+      robot_quat[:, 0],
+      robot_quat[:, 1],
+      robot_quat[:, 2],
+      robot_quat[:, 3],
+    )
+    robot_yaw = torch.atan2(
+      2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz)
+    )
 
     center_xy = self._env.scene.env_origins[env_ids][:, :2]
 
     # Place the ball at a random offset from the robot so it never spawns inside
     # the robot (which would explode contacts), then clamp into the field.
+    # Default: random world-frame bearing. Rear-spawn (Spike A2): a fraction of
+    # episodes force the ball into the rear blind sector (behind the robot,
+    # beyond gaze+camera reach) so the search behavior must engage.
     theta = sample_uniform(-math.pi, math.pi, (n,), device=self.device)
+    if self.cfg.rear_spawn_fraction > 0.0:
+      use_rear = (
+        sample_uniform(0.0, 1.0, (n,), device=self.device)
+        < self.cfg.rear_spawn_fraction
+      )
+      # Rear bearing relative to heading: pi +/- half_angle, then to world.
+      rel = math.pi + sample_uniform(
+        -self.cfg.rear_sector_half_angle,
+        self.cfg.rear_sector_half_angle,
+        (n,),
+        device=self.device,
+      )
+      rear_theta = wrap_to_pi(robot_yaw + rel)
+      theta = torch.where(use_rear, rear_theta, theta)
     dist = sample_uniform(
       self.cfg.spawn_dist_range[0],
       self.cfg.spawn_dist_range[1],
@@ -149,17 +204,51 @@ class DribbleCommand(CommandTerm):
     )
     target_xy = self._field_clamp(ball_xy + target_offset, center_xy)
 
+    # Spike E: for a fraction of envs, override the target with the goal mouth
+    # (goal line in +x, random y within the opening), so the robot learns to
+    # dribble goalward rather than to an arbitrary point.
+    if self.cfg.goal_target_fraction > 0.0:
+      use_goal = (
+        sample_uniform(0.0, 1.0, (n,), device=self.device)
+        < self.cfg.goal_target_fraction
+      )
+      goal_x = torch.full(
+        (n,), self.cfg.goal_line_x, device=self.device
+      )
+      goal_y = sample_uniform(
+        -self.cfg.goal_half_width,
+        self.cfg.goal_half_width,
+        (n,),
+        device=self.device,
+      )
+      # Goal target lives on the goal line; do not field-clamp (clamping would
+      # pull it back inside the pitch and away from the mouth).
+      goal_xy = torch.stack(
+        [goal_x + center_xy[:, 0], goal_y + center_xy[:, 1]], dim=-1
+      )
+      target_xy = torch.where(use_goal.unsqueeze(-1), goal_xy, target_xy)
+
     z = torch.full((n,), self.cfg.ball_radius, device=self.device)
     self.target_pos[env_ids] = torch.cat([target_xy, z.unsqueeze(-1)], dim=-1)
 
-    # Write the ball to its new resting pose with zero velocity.
+    # Write the ball to its new resting pose. Optionally give it an initial
+    # planar velocity (Spike A2) so the policy must track a rolling ball.
     quat = torch.zeros(n, 4, device=self.device)
     quat[:, 0] = 1.0
     pose = torch.cat([ball_xy, z.unsqueeze(-1), quat], dim=-1)
     self.object.write_root_link_pose_to_sim(pose, env_ids=env_ids)
-    self.object.write_root_link_velocity_to_sim(
-      torch.zeros(n, 6, device=self.device), env_ids=env_ids
-    )
+    vel = torch.zeros(n, 6, device=self.device)
+    if self.cfg.ball_init_speed_range[1] > 0.0:
+      speed = sample_uniform(
+        self.cfg.ball_init_speed_range[0],
+        self.cfg.ball_init_speed_range[1],
+        (n,),
+        device=self.device,
+      )
+      vdir = sample_uniform(-math.pi, math.pi, (n,), device=self.device)
+      vel[:, 0] = speed * torch.cos(vdir)
+      vel[:, 1] = speed * torch.sin(vdir)
+    self.object.write_root_link_velocity_to_sim(vel, env_ids=env_ids)
     self._prev_ball_xy[env_ids] = ball_xy
 
   def _update_command(self) -> None:
@@ -256,6 +345,23 @@ class DribbleCommandCfg(CommandTermCfg):
   spawn_dist_range: tuple[float, float] = (0.6, 1.5)
   # Target offset from the ball (m); ensures a non-trivial dribble.
   target_dist_range: tuple[float, float] = (2.0, 6.0)
+
+  # --- Goal-scoring (Spike E) ---
+  # Fraction of episodes whose target is the goal mouth (vs a random point).
+  goal_target_fraction: float = 0.0
+  # Goal mouth geometry: scoring when ball x > goal_line_x and |y| < goal_half_width.
+  goal_line_x: float = 11.0  # +x goal line (== field half_length).
+  goal_half_width: float = 1.0  # Opening y in [-goal_half_width, goal_half_width].
+
+  # --- Search/track behavior (Spike A2) ---
+  # Fraction of episodes that spawn the ball in the rear blind sector (behind
+  # the robot, beyond gaze+camera reach) to force the search behavior.
+  rear_spawn_fraction: float = 0.0
+  # Rear sector half-angle (rad) measured from the robot's -x (rear) axis.
+  rear_sector_half_angle: float = 0.96  # ~55deg blind zone behind the robot.
+  # Initial ball speed range (m/s); >0 makes the ball roll so the policy must
+  # track a moving target. Direction is random in the xy plane.
+  ball_init_speed_range: tuple[float, float] = (0.0, 0.0)
 
   # Derived-twist shaping.
   max_speed: float = 1.0

@@ -1,0 +1,5 @@
+MOS92_urdf_0308.urdf是SW中导出来的urdf
+MOS92_urdf_0308_base_link.urdf转换了关节名字和base_link的名字，固定住了头部关节，其他关节限位是-pi到pi
+MOS92_urdf_0308_simplified.urdf添加了关节限位，并且简化了collision
+
+请使用MOS92_urdf_0308_simplified.urdf用于训练

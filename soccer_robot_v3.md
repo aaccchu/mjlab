@@ -281,28 +281,30 @@ v2 D-vs-B 对比证明:locomotion 对物理变化鲁棒(v1 步态在 v2 物理�
 **RoboCup 标准球参数(当前已正确配置):**
 ```python
 # src/mjlab/terrains/soccer_field.py — SoccerBallCfg
+# ✅ 已实现并实测标定(2026-06-05, Task A),数值非占位:
 radius = 0.11          # 22cm 直径,RoboCup Humanoid League 标准
 mass = 0.43            # kg (规则范围 0.35-0.45)
-friction = (0.5, 0.02, 0.01)  # (slide, spin, roll)
+friction = (0.5, 0.02, 0.02)  # (slide, spin, roll);roll 0.01→0.02 加滚动阻力,球不会无限滑
 condim = 6             # 启用 rolling friction
-solref = (0.02, 1.0)   # 接触刚度/阻尼
-solimp = (0.9, 0.95, 0.001, 0.5, 2.0)
+# 弹性 e≈0.35:MuJoCo 无直接恢复系数,靠 solref 产生。正 solref 封顶 e≈0.25(太死),
+# 负 solref=(-刚度,-阻尼)才能到 RoboCup 级弹跳。在真实 timestep(0.005s)用
+# scripts/calibrate_ball_restitution.py 实测标定:
+solref = (-2300.0, -32.0)   # → e≈0.35(0.31-0.36 over drop 0.3-1.5m);改 timestep 需重标定
+solimp = (0.95, 0.99, 0.0001, 0.5, 2.0)
+# 外观:truncated-icosahedron 纹理(12 红五边形 + 蓝/白六边形,1 块标记用于观测旋转),
+# textured=False 默认关闭(当前 obs 是 depth-only,纹理只影响 viewer/RGB,对训练零影响);
+# 加 RGB obs 后再开。已渲染验证,见 scripts/proto_ball_texture.py。
 ```
 
-**Stage 4 球 Domain Randomization(基于 RoboCup 规则范围):**
+**Stage 4 球 Domain Randomization(✅ 已实现,Task A,startup 模式逐 env 采样):**
 ```python
-events["ball_physics"] = EventTermCfg(
-    func=mdp.randomize_ball_physics,
-    mode="reset",
-    params={
-        "radius_range": (0.105, 0.115),     # ±5% (规则允许 10-11.5cm)
-        "mass_range": (0.35, 0.50),         # 规则范围
-        "slide_friction_range": (0.3, 0.7), # 场地/球面差异
-        "roll_friction_range": (0.005, 0.02),
-        "restitution_range": (0.2, 0.6),    # 弹性(通过 solref 调节)
-        "com_offset_range": (-0.005, 0.005), # 非理想球体重心偏移
-    },
-)
+# src/mjlab/tasks/velocity/config/mos92/env_cfgs.py — 4 个 startup EventTermCfg
+# 复用 mjlab dr.* 函数,弹性 DR 需要的 dr.geom_solref 是 Task A 新增的:
+events["ball_radius"]     = dr.geom_size      # ±5% scale (axis 0)
+events["ball_mass"]       = dr.pseudo_inertia # ±15% mass+inertia 一致缩放 (alpha)
+events["ball_friction"]   = dr.geom_friction  # slide 0.3-0.7
+events["ball_elasticity"] = dr.geom_solref    # 新增函数!stiffness [-9000,-1050] → e∈[0.2,0.6]
+# 已实跑验证:逐 env stiffness 真实分散(-8744…-1070),球 30 步稳定。
 ```
 
 **规则:** penalty_weight = 1.0(完整强度)
@@ -328,13 +330,149 @@ Actor obs  = [proprioception] + [vision] + [command/goal direction]
 Critic obs = [proprioception] + [GT_ball_pos/vel] + [rule_state] + [goal state]
 ```
 
-**视线控制（平台相关,由 v2.5 Spike G 决定）:**
-- **G1 方案:** 策略输出 waist_yaw/pitch 动作主动找球（Spike A 验证）
-- **MOS92 方案（目标平台）:** MOS92 无 waist joints,neck 是 fixed joint。
-  - 如果硬件确认 neck 可改为 revolute → 用 neck_yaw/pitch 作为 gaze action
-  - 如果 neck 不可改 → 只能靠整体转身 + 固定前视相机,gaze 退化为 locomotion 的副产品
-  - 此时 v3 Stage 3 的"主动视线"目标需要大幅简化
-- 启发式 gaze 只允许作为 warmup teacher,不能作为最终控制器（见 §6.4）。
+**视线控制（2026-06-02 已确认: MOS92 neck 可转动 + gaze 行为已验证）:**
+- **MOS92 方案:** 策略输出 neck_yaw/pitch 动作主动找球
+  - neck_yaw: ±90°（左右转头）
+  - neck_pitch: ±28.6°（上下点头）
+  - 优势: 转头不影响躯干重心,不破坏行走稳定性(vs G1 waist 方案)
+  - Spike A-MOS92 已验证(2026-06-02): learned gaze 可行,最优配置
+    **gaze_weight=1.0 + neck pose std=1.0**。带球时 gaze=0.70、神经偏头
+    平均 5.7°/最大 54°、fell_over=0.29。与 G1 结论相反: MOS92 上**紧 neck
+    约束**(让头转完自动回中)比降低 weight 更有效。
+- **G1 方案(历史参考):** 策略输出 waist_yaw/pitch 动作主动找球（Spike A 验证）
+
+**视野中心化 gaze 设计(v3 新增,2026-06-02):**
+
+目标: 不只是让 neck 朝球的"身体系方位角",而是让球落在**相机图像的中心区域**,
+并在球离开视野时主动转头搜索。这是 A-MOS92 gaze reward 的进化版。
+
+A-MOS92 的 `gaze_at_ball` reward 只对齐 `neck_yaw` 和身体系 ball bearing
+(2D 水平角),没有用到 neck_pitch,也不保证球真在相机视锥内。v3 改为
+**基于相机帧的视野中心化**:
+
+1. **观测:** 把球在相机图像中的归一化坐标 `(u, v) ∈ [-1,1]²` 作为 gaze 状态
+   (GT 阶段从 ball_pos 投影到相机内参算出;vision 阶段从 detector 得到)。
+   球不可见时 `(u,v)` 置为哨兵值 + `ball_visible=0` flag。
+
+2. **视野中心化 reward(替代/叠加 gaze_at_ball):**
+   ```python
+   # 球可见时: 奖励球接近图像中心
+   center_reward = visible * exp(-(u² + v²) / std_uv²)   # std_uv ~ 0.4
+   # 同时用 neck_yaw + neck_pitch 两个自由度对准
+   #   u 偏差 → 驱动 neck_yaw, v 偏差 → 驱动 neck_pitch
+   ```
+   这样 neck_pitch 也被激励(近球时低头、远球时平视),而非 A-MOS92 只用 yaw。
+
+3. **球丢失主动搜索 reward:** 球不可见(visible=0)时,奖励 neck 朝
+   "上一次已知球方位 / command goal 方向"扫描,鼓励主动找回球:
+   ```python
+   search_reward = (1 - visible) * exp(-|neck_yaw - last_known_bearing|)
+   ```
+   配合 ball memory(保留最近 N 帧 bearing/range)防止"球一出视野就乱转"。
+
+4. **行进中保持球在视野:** 走向球和踢球过程中,`center_reward` 持续生效,
+   使策略学会"边走边把球钉在视野中心",而不是只在站定时看球。
+
+**验收补充指标:**
+- `ball_in_view_center_rate`: 球落在图像中心 ±40% 区域的时间占比 > 60%
+- `ball_visible_rate`: 球在视锥内的时间占比(行进+踢球全程)> 70%
+- `lost_ball_recovery_time`: 球丢失后重新进入视野的平均步数 < 30
+
+**实现位置:** `rewards.py` 新增 `gaze_center` + `gaze_search`(~40 行),
+观测 `ball_uv` + `ball_visible`(~20 行)。GT 阶段先验证 reward 形状,
+vision 阶段接 detector 输出。先在 Spike E 之后、Stage 3 gaze warmup 时做
+一个 GT 版 spike(Spike A2-MOS92)快速验证视野中心化 reward 能否收敛。
+
+**完整行为时序: 搜索 → 锁定 → 追踪逼近 → 踢球(v3 新增,2026-06-02):**
+
+期望策略涌现出一个连贯的行为序列(不硬编码状态机,用 reward gating 让
+策略自己学出来,符合 §"policy 自主输出搜索动作"原则):
+
+```
+[SEARCH]  球不可见 → 只转头扫描; 头到极限仍找不到 → 原地转身(只转 yaw)
+   ↓ (ball_visible 0→1)
+[LOCK]    球进入视野 → neck 把球钉在图像中心, 观察球的运动方向/速度
+   ↓ (持续可见, 距离仍远)
+[APPROACH] 朝球移动, 头持续追踪保持球居中, 边走边按球的移动方向调整路线
+   ↓ (distance_to_ball < kick_range)
+[KICK]    用脚把球踢向目标点/球门
+```
+
+**阶段 1 — SEARCH(球不可见, 两级搜索):**
+- **第一级(只转头):** 身体和脚保持静止(velocity command ≈ 0),
+  只输出 neck_yaw/pitch 扫描。reward 奖励 neck 朝 last_known_bearing
+  或未探索方位转动。
+- **第二级(原地转身):** neck_yaw 已达极限(±90°)且累计搜索超过 T 步
+  仍 ball_visible=0 → 解锁原地 yaw 旋转(只转身、不位移),
+  覆盖相机+转头都够不到的正后方 ±55° 死区。
+  - 几何依据(A-MOS92/Spike B 实测): neck ±90° + 相机 fov ±35°
+    = 可视方位 ±125°, 正后方约 110° 宽的扇区必须靠转身覆盖。
+- **冻结实现:** 用 `search_freeze` gate —— ball_visible=0 时把
+  locomotion reward 的 tracking 项权重压到 ~0、并惩罚 base 线速度,
+  使"找球前不要乱跑";但允许(第二级)角速度,避免死锁。
+- **关键: 不位移≠不能转身。** 严格"脚不动"只在第一级;第二级允许原地
+  转身是为了打破死区,这是经确认的设计取舍。
+
+**阶段 2 — LOCK(球刚进入视野):**
+- ball_visible 0→1 的瞬间,gaze 切换到 center reward(球钉在图像中心)。
+- 观测里提供球的 image-frame 速度 `(du, dv)` / 世界系 ball_vel,
+  让策略"看到球在动",为后续追踪移动的球做准备。
+- 此阶段仍可短暂不位移(确认球的运动方向),但不强制冻结。
+
+**阶段 3 — APPROACH(追踪逼近, 球可能在动):**
+- locomotion tracking reward 恢复正常权重,策略朝球移动。
+- **头部持续追踪:** center reward 全程生效,要求边走边把球保持在视野中心;
+  `ball_visible_rate`(行进段)是硬验收指标(>70%)。
+- **按球的运动方向调整路线:** 因为球可能在滚动,approach 的目标点应是
+  球的**预测拦截点**(ball_pos + ball_vel·τ),而非当前球位。reward 用
+  robot→(预测球位)的距离递减 + heading 对齐。这让策略学会"提前量"。
+- 球若在逼近中再次离开视野(被自身遮挡/急转)→ 退回 SEARCH 的第一级
+  (只转头找回),不重新转身,避免抖动。
+
+**阶段 4 — KICK(踢球到目标):**
+- distance_to_ball < kick_range 时,kick_contact + ball_to_target/goal_progress
+  reward 主导(复用 Spike E / G-2b 的踢球 reward)。
+- 静止球是 approach 的退化情形(ball_vel≈0, 预测点=当前点),自动覆盖,
+  无需特判 —— 正如你指出的"球静止就更方便"。
+
+**reward gating 机制(不硬编码 FSM):**
+
+各 reward 项的权重由 `ball_visible` 和 `distance_to_ball` 动态门控,
+四个阶段从权重曲线里**自然涌现**:
+
+| reward 项 | SEARCH | LOCK | APPROACH | KICK |
+|-----------|--------|------|----------|------|
+| gaze_search (朝未知方位扫描) | 高 | 0 | 0 | 0 |
+| gaze_center (球居视野中心) | 0 | 高 | 高 | **0**(见下) |
+| base_vel_penalty (惩罚乱跑) | 高 | 中 | 0 | 0 |
+| approach (朝预测球位逼近) | 0 | 低 | 高 | 0 |
+| kick_contact + to_target | 0 | 0 | 低 | 高 |
+
+gate 实现: `w_eff = w_base * sigmoid(...)`,以 ball_visible 和
+distance 为输入做平滑过渡,避免阶段切换处的奖励突变。
+
+> **⚠️ Spike A2-MOS92 实证修正(2026-06-02):足下盲区**
+> 控球/踢球期球被拉到脚边(实测中位球距 0.03m),球在地面比头部低 ~0.38m,
+> 俯角 −37°~−52°,**逼近垂直视野极限(neck −28.6° + FOV −28.6°=−57°),几何上
+> 几乎看不到脚下的球**。这不是 bug 是物理约束。因此:
+> - `gaze_center` 仅在**接近期(球距 >0.5m)门控生效**,KICK 期置 0,不要求球居中,
+>   否则策略会为盯脚下球过度低头、破坏平衡。
+> - 控球/踢球改用**脚部接触 + 本体感知**(robot_to_ball / kick_contact)而非视觉。
+> - Spike A2 实测:搜索成功率 99.8%(首见≈11.6 step),**接近期(>1m)可见率
+>   78.6%**,控球期(<0.5m)14% —— 证明「搜索+接近期对准」设计有效,足下盲区
+>   是预期内的、应当用非视觉感知覆盖的区间。
+
+
+**新增/扩展验收指标:**
+- `search_to_lock_time`: 从球不可见到锁定的平均步数(分球在前方/后方两类统计)
+- `moving_ball_track_rate`: 球运动时仍保持视野中心的时间占比
+- `intercept_success_rate`: 对运动球的拦截/触球成功率
+- `body_frozen_during_search`: SEARCH 第一级 base 位移 < 阈值的时间占比(验证"脚不乱动")
+
+**先验 spike(Stage 3 前):** Spike A2-MOS92 用 GT 球位 + 人为让球
+出视野/滚动,验证 reward gating 能否涌现"搜索→锁定→追踪→踢"序列,
+再进入 vision 训练。
+
 **规则:** penalty_weight = 1.0(维持 Stage 2 强度)
 **感知噪声:** depth/RGB-depth noise + obs delay(逐步加)
 
@@ -368,7 +506,8 @@ Critic obs = [proprioception] + [GT_ball_pos/vel] + [rule_state] + [goal state]
 
 **在 Stage 3 基础上叠加:**
 - 相机 DR(fovy/pos/quat)
-- 球外观 DR(颜色/大小)
+- 球外观 DR(颜色/大小)—— 大小/物理 DR ✅ 已实现(Task A:radius/mass/friction/elasticity);
+  颜色/纹理 DR 待加 RGB obs 后再开(当前 depth-only,纹理对训练无影响,见 §1 球配置)
 - 更大执行器延迟(delay_max_lag=5)
 - 更大外力推扰(±1.0 m/s)
 - torque noise
@@ -399,6 +538,30 @@ Critic obs = [proprioception] + [GT_ball_pos/vel] + [rule_state] + [goal state]
 
 **正确做法:** 每条规则 = 一个 reward term 函数,挂到 `cfg.rewards` 里,
 权重通过 curriculum 调度。和 `kick_contact`、`dribble_approach` 完全同构。
+
+### 违规行为分类(权威规则 → 为什么违规 → RL exploit)
+
+足球是"**动态控制**"不是"占有"。以下 6 类是 v3 必须覆盖的违规,每类标注**为什么违规**和
+**RL 最容易学到的作弊解**(reward hacking 高发区,设计 penalty 时要正面对抗):
+
+| # | 违规 | 判定代理(工程) | 为什么违规 | RL 典型坏策略 | 权重 |
+|---|------|----------------|-----------|--------------|------|
+| 1 | 非法身体接触 | `body_contact and not foot_contact` | 破坏"踢球"本质;非脚部位比脚更稳定→exploit | "贴球走"用大腿推、"压球前进"用躯干挡 | -1.0 |
+| 2 | 持球过久 Holding | `dist<0.4 ∧ speed<0.2 ∧ 持续>1.5s` | 足球是动态控制非占有;防"抱球走" | 把球卡住不动 = 最优解 | -2.0 |
+| 3 | 夹球 Trapping | `foot_contact ∧ body_contact ∧ speed≈0` | **最严重**:完全破坏任务 | 两脚夹球、脚+小腿夹、身体包住球 | **-3.0** |
+| 4 | 粘球 Sticking | `contact ∧ speed<0.05 ∧ 持续>1.0s` | 接触但不推进 = 消极控球 | 一直贴球不踢、球抖动不前进 | -1.0 |
+| 5 | 危险高踢 | `foot_contact ∧ foot_z>阈值` | 多人赛会撞对手;humanoid 尤严 | 高抬腿、向上踢、失控摆腿 | -1.5 |
+| 6 | 冲撞 Charging | `contact ∧ robot_speed>阈值` | 高速撞球而非控制 | 全速撞球、不减速直冲(简单粗暴但有效,RL 爱学) | -0.5 |
+
+**Holding vs Sticking(两者都"球不动",机制不同,不要混为一谈):**
+- **Holding**:长时间**占有**——球在控制范围内但不让它自由移动 → 判据看 `dist + 持续时间`
+- **Sticking**:**接触但无推进**——贴着球但不产生有效运动 → 判据看 `contact + speed≈0`
+
+> **⚠️ 经验验证(2026-06-05, v3d 实测):** 这套分类不是纸上假设。v3d 跳跃修复策略的行为视频里,
+> 机器人反复**"骑"在球上(球卡在胯下/两腿之间)** —— 正是规则 2(持球)+规则 3(夹球)描述的
+> exploit。说明:**只要只奖励"球到目标"而不惩罚占有,RL 必然学到把球卡住。** 规则 2/3 的高权重
+> (-2.0 / -3.0)是对抗这个**已观测到的真实 exploit**,不是预防性猜测。证据见
+> `soccer_eval/2026-06-05_spikes/v3d_jumpfix/`。
 
 ### 规则严谨性:官方规则 → 可测代理 → 工程阈值
 
@@ -1550,7 +1713,7 @@ Stage A/B 的 50%。必须报告 `ball_visible_rate`、`lost_ball_recovery_rate`
 | 步骤 | 内容 | 改动 |
 |------|------|------|
 | C1 | 加 camera DR(fovy/pos/quat) | env_cfgs.py ~10 行 |
-| C2 | 加球外观 DR(rgba/size) | env_cfgs.py ~10 行 |
+| C2 | 加球外观 DR(rgba/size) | env_cfgs.py ~10 行 ✅ 物理 DR(size/mass/friction/elasticity)已实现(Task A);rgba/纹理 DR 待 RGB obs |
 | C3 | 加大执行器延迟 + 外力推扰 | env_cfgs.py ~5 行 |
 | C4 | 写 torque_noise 到 ActuatorCfg | actuator.py ~20 行 |
 | C5 | penalty_weight 提升到 2.0 + holding > 3s terminate | env_cfgs.py ~5 行 |

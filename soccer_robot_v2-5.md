@@ -89,13 +89,25 @@ def gaze_at_ball(env, asset_cfg, command_name) -> Tensor:
 | 部分成功:能转但退化严重 | v3 用 teacher warmup 更长,或限制 yaw 范围 |
 | 失败:转头就摔 | v3 走启发式 gaze(方案 A 作为最终方案),或探索固定 waist_roll + 只学 yaw |
 
+**实验结果 (2026-06-01):**
+
+| 指标 | 起始(step 5000) | 结束(step 5498) | 判定 |
+|------|----------------|----------------|------|
+| fell_over | 0% | **73.9%** | 严重退化 |
+| episode_success | 0% | 91.3% | 未摔时仍能完成 |
+| gaze_at_ball reward | 0.001 | 0.562 | 学会了转头 |
+
+**结论: 部分成功** — 策略确实学会了通过 waist_yaw 转向球,但 fall_rate 从 0% 飙升到 73.9%。
+v3 路径: 需要更长的 teacher warmup(>500 iter)、限制 waist_yaw 范围(±45°→±30°)、
+或者分阶段先稳定行走再加 gaze reward。也可考虑降低 gaze_at_ball weight 到 0.3。
+
 ### 文件改动
 
 | 文件 | 改动 |
 |------|------|
-| `env_cfgs.py` | 放宽 waist pose std,加 gaze_at_ball reward (~10 行) |
-| `rewards.py` | 新增 `gaze_at_ball` 函数 (~15 行) |
-| `mdp/__init__.py` | 导出 (~1 行) |
+| `rewards.py` | 新增 `gaze_at_ball` 函数 |
+| `scripts/spike_a_gaze.py` | 训练脚本 |
+| checkpoint | `logs/rsl_rl/g1_velocity/2026-06-01_15-54-10_spike_a/model_5498.pt` |
 
 ---
 
@@ -150,22 +162,32 @@ head_cam = CameraSensorCfg(
 
 ### 产出
 
-一个截图表格 + 结论:
+**实验已完成 (2026-06-01)**
 
-| 距离 | 球像素数(depth) | 球 seg 面积 | 可检测? | 备注 |
-|------|----------------|-------------|---------|------|
-| 0.5m | ? | ? | ? | |
-| 1.0m | ? | ? | ? | |
-| ... | | | | |
+相机配置: `parent_body=robot/torso_link`, `pos=(0.15, 0, 0.43)`, pitch 30° down, fovy=60°, 64×48
+
+| 距离 | 角度 0° | 角度 ±30° | 角度 60° | 备注 |
+|------|---------|-----------|----------|------|
+| 0.5m | 0 px | 0 px | 0 px | 球在脚下,完全不可见 |
+| 1.0m | 42 px (1.37%) | 43 px (1.40%) | 0 px | 可检测,信号充足 |
+| 2.0m | 14 px (0.46%) | 20 px (0.65%) | 0 px | 可检测,但较小 |
+| 3.0m | 6 px (0.20%) | 10 px (0.33%) | 0 px | 边缘可检测(≥4px) |
+| 5.0m | 2 px (0.07%) | 4 px (0.13%) | 0 px | 极小,不可靠 |
+
+**关键发现:**
+- 水平 FoV 约 ±35°,60° 侧方完全不可见 → gaze 对侧方球至关重要
+- 0.5m 不可见 → 近距离带球时需要 proprioception 而非 vision
+- 5m 处仅 2-4px → 远距离找球需要更高分辨率或 gaze 扫描
+- 自身遮挡问题已通过前移相机(x=0.15)解决
 
 ### 决策
 
 | 结果 | v3 影响 |
 |------|---------|
-| 3m 内 depth 可见(>4px) | depth-only 可行,64×48 够 |
-| 3m 内 depth 不可见但 seg 可见 | 需要 segmentation 辅助或 RGB |
-| 需要 >3m 找球 | 提升分辨率到 96×72,或加远距离 RGB |
-| 自身遮挡严重 | 调整相机位置/俯仰角 |
+| 1-3m depth 可见(6-42px) | **GO**: depth-only 可行,64×48 在 1-3m 够用 |
+| 0.5m 不可见 | 近距离带球阶段不依赖 vision,用 proprioception |
+| 60° 不可见 | **强化 Spike A 必要性**: gaze 是扩展视野的唯一手段 |
+| 5m 仅 2px | 远距离找球需 96×72 或 gaze 扫描,v3 §6 需调整 |
 
 ### 文件改动
 
@@ -195,6 +217,27 @@ head_cam = CameraSensorCfg(
 这意味着 illegal_body_contact penalty 会直接惩罚策略当前的**主要控球方式**。
 
 因此本 spike 需要额外测试一个变体:**先提高 kick_contact reward 再加 penalty**。
+
+### 必须覆盖的 6 类违规(权威分类 → 为什么违规 → RL exploit)
+
+Spike C 只先验证最易误杀的 2 条(illegal_contact / holding),但 v3 最终要覆盖全部 6 类。
+每类都标注**为什么是违规**和 **RL 最爱学的作弊解**,因为 penalty 的真正对手就是这些 exploit:
+
+| # | 违规 | 工程判定 | 为什么违规 | RL 坏策略 | 权重 |
+|---|------|---------|-----------|----------|------|
+| 1 | 非法身体接触 | `body_contact ∧ ¬foot_contact` | 破坏"踢球"本质;非脚更稳→exploit | 大腿推球、躯干挡球贴走 | -1.0 |
+| 2 | 持球 Holding | `dist<0.4 ∧ speed<0.2 ∧ >1.5s` | 足球是动态控制非占有 | 把球卡住不动 | -2.0 |
+| 3 | 夹球 Trapping | `foot ∧ body ∧ speed≈0` | **最严重**,彻底破坏任务 | 两脚夹/身体包住球 | **-3.0** |
+| 4 | 粘球 Sticking | `contact ∧ speed<0.05 ∧ >1.0s` | 接触但不推进 | 贴球不踢、球抖不前进 | -1.0 |
+| 5 | 危险高踢 | `foot_contact ∧ foot_z>阈值` | 多人赛撞对手 | 高抬腿、上踢、失控摆腿 | -1.5 |
+| 6 | 冲撞 Charging | `contact ∧ robot_speed>阈值` | 高速撞球非控制 | 全速撞球不减速 | -0.5 |
+
+**Holding(长时间占有,看 dist+时长) vs Sticking(接触但无推进,看 speed≈0)** —— 两者机制不同,判据不同。
+
+> **⚠️ 已观测到的真实 exploit(2026-06-05, v3d):** v3d 跳跃修复策略的行为视频里,机器人反复
+> **"骑"在球上(球卡在胯下)** —— 正是规则 2(持球)+ 规则 3(夹球)。证明只要任务只奖励
+> "球到目标"而不惩罚占有,RL **必然**学到卡球。这是 Spike C 高 penalty 权重的实证依据,
+> 不是预防性猜测。证据:`soccer_eval/2026-06-05_spikes/v3d_jumpfix/`。完整分类见 v3.md §2。
 
 ### 实验设计
 
@@ -457,6 +500,20 @@ approach_reward = exp(-dist² / 25.0)
 
 **评估时额外测试全场场景：** spawn=(−9,0), ball=(0,0), target=(10.5,0)
 
+**F1 实验结果 (2026-06-01):**
+
+| 指标 | 起始 | 结束(2000 iter) | 判定 |
+|------|------|----------------|------|
+| episode_success | 0% | **67.4%** | 接近目标(70%) |
+| ball_to_target_error | 4.43m | 1.91m | 显著改善 |
+| robot_to_ball_error | 2.56m | 1.00m | 学会走向球 |
+| heading_to_ball | 0.001 | 0.235 | 学会朝向球 |
+| fell_over | 2.17 | 2.29 | 稳定 |
+
+F1 结论：两阶段 reward 结构有效，67.4% 接近 70% 目标。
+approach_delta 数值很小（~0.0002/step）但方向正确。
+checkpoint: `logs/rsl_rl/g1_velocity/2026-06-01_16-07-40_spike_f_f1/model_6998.pt`
+
 ### 决策
 
 | 结果 | v3 影响 |
@@ -499,9 +556,9 @@ approach_reward = exp(-dist² / 25.0)
 |------|-------------------|-------------------|
 | 总质量 | ~35kg | ~16.5kg |
 | 站高 | 0.78m | 0.45m |
-| 自由度 | 29 (含 waist×3, wrist×4) | 18 (无 waist, 无 wrist) |
-| 头部控制 | 无独立关节(挂在 torso_link) | neck_yaw + neck_pitch (**fixed** joints) |
-| 腰部 | waist_yaw/pitch/roll (可转头) | **无** |
+| 自由度 | 29 (含 waist×3, wrist×4) | 20 (含 neck×2, 无 waist/wrist) |
+| 头部控制 | 无独立关节(挂在 torso_link) | **neck_yaw + neck_pitch** (revolute, 已确认) |
+| 腰部 | waist_yaw/pitch/roll (可转头) | **无**(转头由 neck 负责) |
 | 手臂 | shoulder_pitch/roll/yaw + elbow + wrist×2 | shoulder_pitch/roll + elbow |
 | 腿部 | hip_pitch/roll/yaw + knee + ankle_pitch/roll | 同(6 DOF/leg) |
 | 执行器类型 | PD 位置控制 (kp/kd) | 力矩电机 (ctrlrange ±36/60 Nm) |
@@ -510,12 +567,11 @@ approach_reward = exp(-dist² / 25.0)
 
 ### 对 v3 方案的根本性影响
 
-**1. Gaze 方案必须重设计:**
-- G1 方案：用 waist_yaw/pitch 转动 torso 来改变相机朝向
-- MOS92 现实：无 waist joints,neck 是 fixed → **无法主动转头**
-- 选项 A：相机固定在 head 上,只能靠整体转身改变视野
-- 选项 B：将 neck_yaw/pitch 从 fixed 改为 revolute（需硬件确认是否可行）
-- 选项 C：用全景相机/多相机替代单目主动 gaze
+**1. Gaze 方案已确定(2026-06-01 更新):**
+- MOS92 neck 已确认可转动,xml 中加入 neck_yaw(±90°) + neck_pitch(±28.6°)
+- v3 gaze 方案:**策略输出 neck_yaw/pitch 主动转头找球**
+- 优势:转头不影响躯干重心/行走稳定性(vs G1 waist 方案会破坏平衡)
+- Spike A-MOS92 将验证这一方案
 
 **2. 执行器模型不同:**
 - G1：PD 位置控制,action = target joint position (`JointPositionActionCfg`)
@@ -535,9 +591,10 @@ approach_reward = exp(-dist² / 25.0)
   - 踢球时腿需要抬得更高才能越过球心 → dangerous_kick 阈值可能需要调整
 - Spike G-2 需要验证：MOS92 能否有效控球,还是只能"推球"
 
-**4. Spike A (Gaze) 对 MOS92 不适用:**
-- Spike A 测试的是 waist_yaw/pitch 转头 → MOS92 没有这些关节
-- 需要替换为：测试 MOS92 能否通过整体转身找球,或验证 neck 改为 revolute 的可行性
+**4. Spike A (Gaze) 在 MOS92 上需要重新验证:**
+- G1 Spike A 测试的是 waist_yaw/pitch 转头 → MOS92 用 neck_yaw/pitch
+- MOS92 方案理论上更优(转头不影响躯干),但需要实验确认
+- 预期:即使 gaze weight=1.0 也不应摔倒(neck 质量小,不影响重心)
 
 ### 实验设计
 
@@ -562,11 +619,11 @@ approach_reward = exp(-dist² / 25.0)
    - 2000-3000 iter,观察是否收敛
    - 对比 G1 的学习曲线
 
-**Step G-3: Gaze 方案确认（~0.5 天）**
+**Step G-3: Gaze 验证（已合并到 Spike A-MOS92）**
 
-1. 确认 MOS92 neck 是否可以改为 revolute（需要硬件团队确认）
-2. 如果可以：测试 neck_yaw/pitch 作为 gaze action 的可行性
-3. 如果不可以：测试"整体转身找球"策略的效果（approach 阶段自然朝向球）
+1. ~~确认 MOS92 neck 是否可以改为 revolute~~ → **已确认,neck_yaw/pitch 已加入 xml**
+2. Gaze 验证合并到 Spike A-MOS92 重跑中(见 §7b)
+3. 验证 neck_yaw/pitch 作为 gaze action 是否影响行走稳定性
 
 ### 观察指标
 
@@ -586,8 +643,8 @@ approach_reward = exp(-dist² / 25.0)
 | G-1 行走失败 | 需要调试 actuator model 或 xml 参数,阻塞后续 |
 | G-2 带球成功 | v3 直接在 MOS92 上执行 |
 | G-2 带球成功但 kick_contact 更弱 | MOS92 脚型可能不适合踢球,需要调整 foot collision |
-| G-3 neck 可改 revolute | v3 gaze 方案用 neck joints（比 G1 waist 更合理） |
-| G-3 neck 不可改 | v3 gaze 只能靠整体转身 + 固定前视相机,大幅简化 |
+| G-3 neck 可改 revolute | v3 gaze 方案用 neck joints（比 G1 waist 更合理） | **已确认 ✓** |
+| G-3 neck 不可改 | v3 gaze 只能靠整体转身 + 固定前视相机,大幅简化 | N/A |
 
 ### 文件改动
 
@@ -602,11 +659,14 @@ approach_reward = exp(-dist² / 25.0)
 
 ## 7. 执行顺序和时间
 
+> **2026-06-01 更新:** Spike G-1 已通过,确认 MOS92 neck 可改为 revolute。
+> 后续所有 spike 统一在 MOS92 平台上执行。详见 §7b。
+
 ```
-Day 1 AM: Spike B（相机验证,不训练,1-2 小时）
-Day 1 PM: Spike A（gaze 可行性,500 iter,2-3 小时）— 仅 G1,视 Spike G 结果决定价值
-Day 1 PM: Spike G Step 1（MOS92 资产导入,并行）
-Day 2 AM: Spike F（全场尺度,3 组×2000 iter）— 先于 Spike E,因为 E 需要全场能力
+Day 1 AM: Spike B（相机验证,不训练,1-2 小时）— G1 ✓ 已完成
+Day 1 PM: Spike A（gaze 可行性,500 iter,2-3 小时）— G1 ✓ 已完成
+Day 1 PM: Spike G Step 1（MOS92 资产导入,并行）— ✓ 已完成
+Day 2 AM: Spike F（全场尺度,3 组×2000 iter）— G1 ✓ 已完成
 Day 2 AM: Spike G Step 2（MOS92 行走训练,并行）
 Day 2 PM: Spike C（penalty 数值扫描,5×500 iter 并行）
 Day 2-3:  Spike D（delay 耐受度扫描）
@@ -620,6 +680,111 @@ Day 3-4:  汇总结果,写入 stage_eval.md,决定 v3 路径
 - Spike G Step 2/3 依赖 Step 1（资产导入）
 - Spike A 的价值取决于 Spike G 的结果（MOS92 是否有 gaze joints）
 - 其余 spike 互相独立
+
+---
+
+## 7b. MOS92 平台迁移后的更新计划 (2026-06-01)
+
+### 背景
+
+Spike G-1 已通过:MOS92 在 mjlab 中稳定行走(fell_over=0, mean_reward=83.2)。
+同时确认:**MOS92 头部硬件支持 neck_yaw + neck_pitch 转动**,xml 中已加入关节。
+
+这意味着:
+- v3 目标平台确认为 MOS92(20-DOF: 18 原有 + 2 neck)
+- Gaze 方案:用 **neck_yaw/pitch** 主动转头(优于 G1 的 waist 方案,转头不影响躯干)
+- 后续所有 spike 统一在 MOS92 上执行,G1 结果仅作历史参考
+
+### 各 Spike 受影响分析与重跑方案
+
+#### Spike A (Gaze) → 必须重跑 ★★★
+
+**原因:** 核心机制完全改变。G1 用 waist_yaw/pitch(转躯干)→ MOS92 用
+neck_yaw/pitch(只转头)。MOS92 方案理论上更好:转头不影响平衡和行走。
+
+**MOS92 版实验设计:**
+- 基线: MOS92 velocity checkpoint(G-1 完成后)
+- 在 velocity task 上加 `gaze_at_ball` reward,控制 neck_yaw/pitch
+- neck joints 作为 action space 的一部分(已在 env_cfgs 中)
+- pose reward 中 neck_yaw/pitch 的 std 控制转头幅度约束
+
+**实验组:**
+| 组 | gaze weight | neck_yaw pose std | neck_pitch pose std | 预期 |
+|----|------------|-------------------|--------------------|----|
+| A-M1 | 0.3 | 0.3 | 0.2 | 保守,对标 G1 A-2 |
+| A-M2 | 1.0 | 0.5 | 0.3 | 激进,G1 版崩溃了但 MOS92 应该稳 |
+| A-M3 | 1.0 | 1.0 | 0.5 | 极限,验证 neck 转头是否真的不影响平衡 |
+
+**关键假设:** MOS92 用 neck 转头不影响躯干重心 → 即使 weight=1.0 也不应该摔倒。
+如果 A-M2/M3 也不摔,说明 neck gaze 方案本质优于 G1 waist gaze。
+
+**验收:** fall_fraction < 5% + gaze reward > 0.3 即通过。
+
+#### Spike B (相机视野) → 需要重跑 ★★
+
+**原因:** MOS92 身高 0.45m vs G1 0.78m,相机挂载位置完全不同。
+且 MOS92 neck 可动 → 相机视野随 neck 姿态变化,需要重新评估。
+
+**MOS92 版实验设计:**
+- 相机挂载在 `head` body 上(随 neck 转动)
+- 测试: neck_yaw=0/±30°/±60° × neck_pitch=0/±15° 的视野覆盖
+- 球在 0.5/1/2/3/5m 距离的像素覆盖
+- pos/quat 需要根据 MOS92 头部几何重新设计
+
+**关键差异:**
+- MOS92 相机更矮(~0.45+0.24=0.69m head top vs G1 ~1.0m)
+- 但 MOS92 neck 可独立转动 → 主动 gaze 覆盖范围更大
+- 球在视野中的比例更大(因为离球更近)
+
+#### Spike C (Penalty 平衡) → 直接在 MOS92 上做 ★
+
+**原因:** C 尚未执行。直接在 MOS92 上做,不需要先在 G1 上跑。
+
+**改动:** 从 MOS92 soccer checkpoint(G-2 完成后)出发,扫描 penalty 权重。
+kick_contact 的 foot body pattern 需要改为 MOS92 的 `Rfoot/Lfoot`。
+
+#### Spike D (延迟耐受度) → 直接在 MOS92 上做 ★
+
+**原因:** D 尚未执行。MOS92 电机延迟特性可能与 G1 不同,直接测 MOS92。
+
+#### Spike E (Goal-Scoring) → 直接在 MOS92 上做 ★★
+
+**原因:** E 尚未执行。MOS92 体型更小,踢球动力学不同,需要验证能否进球。
+依赖 G-2(MOS92 带球)通过后执行。
+
+#### Spike F (全场尺度) → 不重跑 (结论平台无关)
+
+**原因:** F 验证的是 reward 结构(approach_delta + heading_to_ball)在远距离下
+是否衰减。结论"需要 distance curriculum"是数学性质,与机器人平台无关。
+MOS92 的全场任务直接继承 F 的 reward 设计。
+
+#### Spike G (MOS92 适配) → 继续执行 G-2/G-3
+
+G-1 已通过。下一步:
+- **G-2:** MOS92 带球(soccer field + dribble command)
+- **G-3:** 不再需要"确认 neck 可否改 revolute"(已确认),
+  改为: Spike A-MOS92 gaze 验证(合并到 A 重跑中)
+
+### 更新后的执行顺序
+
+```
+[已完成] Spike B-G1, A-G1, F-G1, G-1 — G1 平台的历史验证
+[已完成] G-1 (MOS92 行走) ✓
+[已完成] Spike A-MOS92 (gaze with neck joints) ✓ — 最优 weight=1.0+tight neck_std
+[已完成] G-2 (MOS92 带球) ✓ — kick_contact=0.82, dribble=4.14
+[已完成] Spike E-MOS92 (goal-scoring) ✓ — goal_rate 峰值 24%, v3 门槛通过
+         (Spike B-MOS92 跳过: G1 相机几何结论可迁移,见 v2_experiment.md)
+[已完成] Spike A2-MOS92 (视野中心化 + 搜索→追踪→踢 时序) ✓ — 时序涌现验证通过
+         搜索成功率 99.8%,接近期(>1m)可见率 78.6%;发现「足下盲区」几何约束
+[之后]   Spike C-MOS92 (penalty 扫描)
+[之后]   Spike D-MOS92 (delay 耐受度)
+```
+
+**Critical path 已打通:** A-MOS92 ✓ > G-2 ✓ > E-MOS92 ✓ > A2-MOS92 ✓ → **v3 可启动**。
+A2-MOS92 已验证 v3 §Stage3 的"视野中心化 gaze + 搜索/追踪时序"设计可从 reward
+gating 涌现(详见 soccer_robot_v3.md "完整行为时序"章节),并修正了 gaze_center
+的阶段门控(足下盲区 → KICK 期置 0,改用脚部/本体感知)。为 Stage 3 vision 铺路。
+C/D 是参数调优,不阻塞 v3 启动。
 
 **总计 3-4 天,产出:**
 - 7 个 go/no-go 决策
@@ -636,15 +801,15 @@ Day 3-4:  汇总结果,写入 stage_eval.md,决定 v3 路径
 
 ## 8. 产出汇总表(填入 stage_eval.md)
 
-| Spike | 问题 | 结果 | v3 决策 |
-|-------|------|------|---------|
-| A: Gaze | G1 能学会转头? | TBD | learned vs heuristic gaze (仅 G1 适用) |
-| B: Camera | 球在 depth 里可见? | TBD | 分辨率/fov/是否需要 RGB |
-| C: Penalty | 规则会杀死进球? | TBD | penalty_weight 起始值 + kick_contact 前置 |
-| D: Delay | 能忍受多少延迟? | TBD | delay_max_lag 目标 + history 需求 |
-| E: Goal | 能学会进球? | TBD | v3 是否可启动 |
-| F: Full-field | 两阶段能泛化全场? | TBD | reward 结构 + 是否需要 distance curriculum |
-| G: MOS92 | 目标机器人能走+带球? | TBD | v3 平台选择 + gaze 方案重设计 |
+| Spike | 问题 | G1 结果 | MOS92 计划 | v3 决策 |
+|-------|------|---------|-----------|---------|
+| A: Gaze | 能学会转头? | ✓ weight≤0.3 可行 | **重跑**: neck_yaw/pitch,预期更好 | neck gaze 方案 |
+| B: Camera | 球在 depth 里可见? | ✓ 1-3m 可检测 | **重跑**: 头部更矮+neck 可动 | 分辨率/fov 重新确认 |
+| C: Penalty | 规则会杀死进球? | 未做 | 直接在 MOS92 上做 | penalty_weight 起始值 |
+| D: Delay | 能忍受多少延迟? | 未做 | 直接在 MOS92 上做 | delay_max_lag 目标 |
+| E: Goal | 能学会进球? | 未做 | 直接在 MOS92 上做 | v3 是否可启动 |
+| F: Full-field | 两阶段能泛化全场? | ✓ 4m行/9m崩 | 不重跑(结论平台无关) | 需 distance curriculum |
+| G: MOS92 | 目标机器人能走+带球? | N/A | G-1✓ / G-2 待做 | MOS92 确认为 v3 平台 |
 
 ---
 

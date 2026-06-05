@@ -23,6 +23,7 @@ import math
 from dataclasses import dataclass
 
 import mujoco
+import numpy as np
 
 # Render group for all field geoms. Kept out of group 0 so the velocity task's
 # foot/terrain height scanners (which include only group 0) ignore the thin
@@ -53,14 +54,99 @@ class SoccerBallCfg:
   it can be repositioned per-env on reset.
   """
 
-  radius: float = 0.11  # Diameter 0.22 m.
+  radius: float = 0.11  # Diameter 0.22 m (RoboCup MSL / FIFA size-5).
   mass: float = 0.43
   rgba: tuple[float, float, float, float] = (1.0, 0.4, 0.0, 1.0)  # High-contrast.
-  # MuJoCo geom friction (slide, spin, roll). Low spin/roll keeps it rolling.
-  friction: tuple[float, float, float] = (0.5, 0.02, 0.01)
-  solref: tuple[float, float] = (0.02, 1.0)
-  # solimp: (dmin, dmax, width, midpoint, power) — MuJoCo expects 5 values.
-  solimp: tuple[float, float, float, float, float] = (0.9, 0.95, 0.001, 0.5, 2.0)
+  # MuJoCo geom friction (slide, spin, roll). slide=0.5 matches turf grip; small
+  # spin/roll give slight rolling resistance so the ball rolls but does not coast
+  # forever. roll=0.02 noticeably damps long rolls vs the old 0.01.
+  friction: tuple[float, float, float] = (0.5, 0.02, 0.02)
+  # Restitution: MuJoCo has no direct e coefficient; bounce emerges from solref.
+  # Positive (timeconst, dampratio) caps at e~0.25 (too dead). NEGATIVE solref =
+  # direct (-stiffness, -damping), which reaches RoboCup-like bounce.
+  # CALIBRATED via scripts/calibrate_ball_restitution.py at the real physics
+  # timestep (0.005 s): solref=(-2300, -32) -> e~=0.35 (0.31-0.36 over drop
+  # heights 0.3-1.5 m). Re-calibrate if sim.timestep changes.
+  solref: tuple[float, float] = (-2300.0, -32.0)
+  # solimp: (dmin, dmax, width, midpoint, power) — stiffer than default for a
+  # crisp ball contact; used during the restitution calibration above.
+  solimp: tuple[float, float, float, float, float] = (0.95, 0.99, 0.0001, 0.5, 2.0)
+  # Truncated-icosahedron texture (12 red pentagons + blue/white hexagons, one
+  # marked for rotation observability). VIEWER/RGB ONLY — the current vision obs
+  # is depth-only, so this has ZERO effect on training. Off by default to keep
+  # builds light; enable for demo renders or once an RGB obs is added.
+  textured: bool = False
+  texture_size: int = 128  # Per cube-face resolution.
+
+
+def _ball_face_centers():
+  """Truncated-icosahedron face centers on the unit sphere.
+
+  Returns (pentagon_centers[12,3], hexagon_centers[20,3]): the 12 icosahedron
+  vertices are the pentagon centers; the 20 triangular-face centroids are the
+  hexagon centers.
+  """
+  from scipy.spatial import ConvexHull
+
+  phi = (1.0 + 5.0**0.5) / 2.0
+  verts = np.array(
+    [
+      (0, 1, phi), (0, 1, -phi), (0, -1, phi), (0, -1, -phi),
+      (1, phi, 0), (1, -phi, 0), (-1, phi, 0), (-1, -phi, 0),
+      (phi, 0, 1), (phi, 0, -1), (-phi, 0, 1), (-phi, 0, -1),
+    ],
+    dtype=np.float64,
+  )
+  verts /= np.linalg.norm(verts, axis=1, keepdims=True)
+  hull = ConvexHull(verts)
+  hexc = np.array([verts[s].mean(axis=0) for s in hull.simplices])
+  hexc /= np.linalg.norm(hexc, axis=1, keepdims=True)
+  return verts, hexc
+
+
+# Soccer-ball texture palette (RGB 0-255).
+_BALL_RED = (220, 30, 30)
+_BALL_BLUE = (30, 60, 200)
+_BALL_WHITE = (245, 245, 245)
+_BALL_MARK = (15, 15, 15)  # One darker hexagon for rotation observability.
+
+# MuJoCo cube-face direction generators (+x,-x,+y,-y,+z,-z), as functions of the
+# in-face coords (uu, vv) and a matching ones array.
+_CUBE_FACE_AXES = (
+  lambda u, v, o: (o, -v, -u),
+  lambda u, v, o: (-o, -v, u),
+  lambda u, v, o: (u, o, v),
+  lambda u, v, o: (u, -o, -v),
+  lambda u, v, o: (u, -v, o),
+  lambda u, v, o: (-u, -v, -o),
+)
+
+
+def _ball_cube_texture(n: int) -> np.ndarray:
+  """Build the (6n, n, 3) uint8 cube texture for the soccer ball."""
+  pent, hexc = _ball_face_centers()
+  t = (np.arange(n) + 0.5) / n * 2.0 - 1.0
+  uu, vv = np.meshgrid(t, t)
+  ones = np.ones_like(uu)
+  faces = []
+  for axis in _CUBE_FACE_AXES:
+    x, y, z = axis(uu, vv, ones)
+    dirs = np.stack([x, y, z], axis=-1).reshape(-1, 3)
+    dirs /= np.linalg.norm(dirs, axis=1, keepdims=True)
+    pent_best = (dirs @ pent.T).max(axis=1)
+    hex_dot = dirs @ hexc.T
+    hex_idx = hex_dot.argmax(axis=1)
+    hex_best = hex_dot.max(axis=1)
+    rgb = np.zeros((dirs.shape[0], 3), dtype=np.uint8)
+    is_pent = pent_best >= hex_best
+    rgb[is_pent] = _BALL_RED
+    hmask = ~is_pent
+    hi = hex_idx[hmask]
+    hrgb = np.where((hi % 2)[:, None] == 0, np.array(_BALL_BLUE), np.array(_BALL_WHITE))
+    hrgb[hi == 0] = _BALL_MARK
+    rgb[hmask] = hrgb
+    faces.append(rgb.reshape(n, n, 3))
+  return np.concatenate(faces, axis=0)
 
 
 def get_soccer_ball_spec(cfg: SoccerBallCfg | None = None) -> mujoco.MjSpec:
@@ -76,17 +162,37 @@ def get_soccer_ball_spec(cfg: SoccerBallCfg | None = None) -> mujoco.MjSpec:
   spec = mujoco.MjSpec()
   body = spec.worldbody.add_body(name="ball", pos=(0.0, 0.0, cfg.radius))
   body.add_freejoint(name="ball_joint")
-  body.add_geom(
+
+  # Optional truncated-icosahedron texture (viewer/RGB only; no effect on the
+  # depth-only training obs). Built as a cube texture mapped onto the sphere.
+  material_name = ""
+  if cfg.textured:
+    spec.add_texture(
+      name="ball_tex",
+      type=mujoco.mjtTexture.mjTEXTURE_CUBE,
+      width=cfg.texture_size,
+      height=6 * cfg.texture_size,
+    )
+    spec.textures[0].data = _ball_cube_texture(cfg.texture_size).tobytes()
+    mat = spec.add_material(name="ball_mat")
+    mat.textures[mujoco.mjtTextureRole.mjTEXROLE_RGB] = "ball_tex"
+    material_name = "ball_mat"
+
+  geom_kwargs = dict(
     type=mujoco.mjtGeom.mjGEOM_SPHERE,
     size=(cfg.radius, 0.0, 0.0),
     mass=cfg.mass,
-    rgba=cfg.rgba,
     condim=6,
     friction=cfg.friction,
     solref=cfg.solref,
     solimp=cfg.solimp,
     name="ball_geom",
   )
+  if material_name:
+    geom_kwargs["material"] = material_name
+  else:
+    geom_kwargs["rgba"] = cfg.rgba
+  body.add_geom(**geom_kwargs)
   return spec
 
 
