@@ -384,3 +384,59 @@ class SiteEffortAction(BaseAction):
     self._entity.set_site_effort_target(
       self._processed_actions, site_ids=self._target_ids
     )
+
+
+##
+# Cognitive (non-motor) actions.
+##
+
+
+@dataclass(kw_only=True)
+class SelfLocActionCfg(ActionTermCfg):
+  """Configuration for a cognitive self-localization output.
+
+  This is NOT a motor action: it widens the policy's action head by ``dim``
+  extra dimensions that the policy uses to *report its estimate* of where it is
+  on the field. The value never touches the simulation; it is read back by a
+  reward (estimate-vs-ground-truth accuracy) and fed to the next-step
+  observation via the existing ``last_action`` term. See the v3g self-loc plan.
+  """
+
+  dim: int = 4
+  """Number of cognitive output dimensions (e.g. [x_n, y_n, sin(yaw), cos(yaw)])."""
+
+  def build(self, env: ManagerBasedRlEnv) -> SelfLocAction:
+    return SelfLocAction(self, env)
+
+
+class SelfLocAction(ActionTerm):
+  """Cognitive output: the policy's estimate of its own field pose.
+
+  A no-op on the physics — ``apply_actions`` does nothing. The raw value is
+  stored so a reward function can score it against ground truth and the next
+  observation can feed it back to the policy.
+  """
+
+  cfg: SelfLocActionCfg
+
+  def __init__(self, cfg: SelfLocActionCfg, env: ManagerBasedRlEnv):
+    super().__init__(cfg=cfg, env=env)
+    self._raw_actions = torch.zeros(self.num_envs, cfg.dim, device=self.device)
+
+  @property
+  def action_dim(self) -> int:
+    return self.cfg.dim
+
+  @property
+  def raw_action(self) -> torch.Tensor:
+    return self._raw_actions
+
+  def process_actions(self, actions: torch.Tensor) -> None:
+    self._raw_actions[:] = actions
+
+  def apply_actions(self) -> None:
+    # Cognitive output: deliberately does not drive the simulation.
+    pass
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    self._raw_actions[env_ids] = 0.0

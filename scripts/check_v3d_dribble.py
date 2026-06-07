@@ -19,19 +19,8 @@ Usage: MUJOCO_GL=egl uv run python scripts/check_v3d_dribble.py <run_dir>
 
 from __future__ import annotations
 
-import os
 import sys
-from dataclasses import asdict
 from pathlib import Path
-
-import torch
-
-from mjlab.envs import ManagerBasedRlEnv
-from mjlab.rl import MjlabOnPolicyRunner, RslRlVecEnvWrapper
-from mjlab.tasks.velocity.config.mos92.env_cfgs import mos92_soccer_vision_ablation_env_cfg
-from mjlab.tasks.velocity.config.mos92.rl_cfg import mos92_vision_ppo_runner_cfg
-from mjlab.tasks.velocity.mdp.dribble_command import DribbleCommand, DribbleCommandCfg
-from mjlab.utils.torch import configure_torch_backends
 
 RUN_DIR = Path(sys.argv[1]) if len(sys.argv) > 1 else None
 NUM_ENVS = 64

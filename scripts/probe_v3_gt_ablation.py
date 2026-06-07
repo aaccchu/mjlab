@@ -66,7 +66,7 @@ def _gt_slices(obs_mgr) -> tuple[list[tuple[int, int]], int]:
   slices: list[tuple[int, int]] = []
   visible_col = -1
   offset = 0
-  for name, shape in zip(names, dims):
+  for name, shape in zip(names, dims, strict=False):
     width = int(torch.tensor(shape).prod().item()) if len(shape) else 1
     if name in GT_BALL_TERMS:
       slices.append((offset, offset + width))
@@ -78,8 +78,10 @@ def _gt_slices(obs_mgr) -> tuple[list[tuple[int, int]], int]:
     f"expected {GT_BALL_TERMS} in actor obs, found {found}: {names}"
   )
   assert visible_col >= 0, "ball_gaze_uv not found in actor obs"
-  print(f"[INFO] actor 1D obs width={offset}, GT-ball slices={slices}, "
-        f"visible_col={visible_col}")
+  print(
+    f"[INFO] actor 1D obs width={offset}, GT-ball slices={slices}, "
+    f"visible_col={visible_col}"
+  )
   return slices, visible_col
 
 
@@ -142,11 +144,13 @@ def main() -> None:
   # Baseline first (GT intact), then ablated. Each pass resets inside its own
   # inference_mode block, so they start from comparable distributions.
   print(f"\n[INFO] === BASELINE (GT intact), {N_STEPS} steps, {NUM_ENVS} envs ===")
-  base = _run_pass(env, runner, device, ablate=False, slices=slices,
-                   visible_col=visible_col)
-  print(f"[INFO] === ABLATED (GT ball-vector zeroed -> camera only) ===")
-  abl = _run_pass(env, runner, device, ablate=True, slices=slices,
-                  visible_col=visible_col)
+  base = _run_pass(
+    env, runner, device, ablate=False, slices=slices, visible_col=visible_col
+  )
+  print("[INFO] === ABLATED (GT ball-vector zeroed -> camera only) ===")
+  abl = _run_pass(
+    env, runner, device, ablate=True, slices=slices, visible_col=visible_col
+  )
 
   env.close()
 

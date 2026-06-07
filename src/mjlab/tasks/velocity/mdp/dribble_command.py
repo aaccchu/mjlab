@@ -66,6 +66,17 @@ class DribbleCommand(CommandTerm):
     self.newly_scored = torch.zeros(self.num_envs, device=self.device)
     self.metrics["goal_rate"] = torch.zeros(self.num_envs, device=self.device)
 
+    # Anti-cheat state (rule penalties consume these; see rewards.py).
+    # ball_speed: world-frame ball xy speed (m/s), the core "is the ball moving"
+    #   signal for holding/sticking/trapping detection.
+    # holding_time: seconds the ball has stayed near+slow (占有 -> reset on release).
+    # ball_stuck_time: seconds the ball has been ~stationary (粘球, independent of
+    #   distance; distinguishes "stuck" from "held"). Both accumulate by step_dt
+    #   and reset to 0 the moment the condition breaks.
+    self.metrics["ball_speed"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["holding_time"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["ball_stuck_time"] = torch.zeros(self.num_envs, device=self.device)
+
   @property
   def command(self) -> torch.Tensor:
     """Derived base-frame twist [vx, vy, wz] for gait-reward gating."""
@@ -101,6 +112,26 @@ class DribbleCommand(CommandTerm):
     ball_disp = torch.norm(ball_xy - self._prev_ball_xy, dim=-1)
     self.metrics["ball_path_length"] += ball_disp
     self._prev_ball_xy = ball_xy.clone()
+
+    # Anti-cheat signals. ball_speed from the ball's own world velocity (xy);
+    # holding = near AND slow (占有), accumulated in seconds; ball_stuck = slow
+    # regardless of distance (粘球). Both reset to 0 the step the condition breaks,
+    # so the reward sees CONTINUOUS duration, not a lifetime counter.
+    dt = self._env.step_dt
+    ball_speed = torch.norm(self.ball_lin_vel_w[:, :2], dim=-1)
+    self.metrics["ball_speed"] = ball_speed
+    is_holding = (robot_to_ball < 0.4) & (ball_speed < 0.2)
+    self.metrics["holding_time"] = torch.where(
+      is_holding,
+      self.metrics["holding_time"] + dt,
+      torch.zeros_like(self.metrics["holding_time"]),
+    )
+    is_stuck = ball_speed < 0.05
+    self.metrics["ball_stuck_time"] = torch.where(
+      is_stuck,
+      self.metrics["ball_stuck_time"] + dt,
+      torch.zeros_like(self.metrics["ball_stuck_time"]),
+    )
 
     # Spike E: goal-scoring latch. Ball must cross the +x goal line within the
     # mouth opening. Coordinates are env-local (subtract env origin). The goal
@@ -139,6 +170,8 @@ class DribbleCommand(CommandTerm):
     self.metrics["possession"][env_ids] = 0.0
     self.metrics["ball_path_length"][env_ids] = 0.0
     self.metrics["step_count"][env_ids] = 0.0
+    self.metrics["holding_time"][env_ids] = 0.0
+    self.metrics["ball_stuck_time"][env_ids] = 0.0
 
     # Robot spawn pose lives in fresh qpos at reset time; xpos (root_link_pos_w)
     # is still stale here because no sim.forward() runs between the reset event
@@ -153,9 +186,7 @@ class DribbleCommand(CommandTerm):
       robot_quat[:, 2],
       robot_quat[:, 3],
     )
-    robot_yaw = torch.atan2(
-      2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz)
-    )
+    robot_yaw = torch.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
 
     center_xy = self._env.scene.env_origins[env_ids][:, :2]
 
@@ -212,9 +243,7 @@ class DribbleCommand(CommandTerm):
         sample_uniform(0.0, 1.0, (n,), device=self.device)
         < self.cfg.goal_target_fraction
       )
-      goal_x = torch.full(
-        (n,), self.cfg.goal_line_x, device=self.device
-      )
+      goal_x = torch.full((n,), self.cfg.goal_line_x, device=self.device)
       goal_y = sample_uniform(
         -self.cfg.goal_half_width,
         self.cfg.goal_half_width,

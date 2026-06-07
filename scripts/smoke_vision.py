@@ -21,8 +21,8 @@ import numpy as np
 import torch
 
 from mjlab.envs import ManagerBasedRlEnv
-from mjlab.tasks.velocity.config.mos92 import env_cfgs
 from mjlab.sensor import CameraSensor
+from mjlab.tasks.velocity.config.mos92 import env_cfgs
 
 DEV = "cuda:0"
 N = 8
@@ -77,7 +77,7 @@ def _save_depth_png(depth: torch.Tensor, path: str):
 
   d = depth[0, ..., 0].cpu().numpy()
   d = np.clip(d, 0.0, 3.0) / 3.0
-  img = (1.0 - d)  # near = bright
+  img = 1.0 - d  # near = bright
   media.write_image(path, (img * 255).astype(np.uint8))
 
 
@@ -108,10 +108,14 @@ def main() -> None:
   depth = cam.data.depth
   assert depth is not None, "no depth!"
   base_depth = depth[..., 0].clone()  # [B,H,W] robot's own geometry
-  print(f"(a) depth shape={tuple(depth.shape)} finite={torch.isfinite(depth).all().item()} "
-        f"min={depth.min().item():.3f} max={depth.max().item():.3f}")
-  print(f"    baseline (ball@50m) near-px(<0.6)={(base_depth<0.6).float().sum(dim=(1,2)).mean().item():.0f} "
-        f"-- this is the robot's own body in view")
+  print(
+    f"(a) depth shape={tuple(depth.shape)} finite={torch.isfinite(depth).all().item()} "
+    f"min={depth.min().item():.3f} max={depth.max().item():.3f}"
+  )
+  print(
+    f"    baseline (ball@50m) near-px(<0.6)={(base_depth < 0.6).float().sum(dim=(1, 2)).mean().item():.0f} "
+    f"-- this is the robot's own body in view"
+  )
   os.makedirs("/tmp/smoke_depth", exist_ok=True)
   _save_depth_png(depth, "/tmp/smoke_depth/baseline.png")
 
@@ -121,22 +125,32 @@ def main() -> None:
     _place_ball_ahead(env, d)
     _refresh(env)
     cur = cam.data.depth[..., 0]
-    diff = (base_depth - cur)  # ball nearer than background => positive
+    diff = base_depth - cur  # ball nearer than background => positive
     mask = diff > 0.1
     cnt = mask.float().sum(dim=(1, 2))
     H, W = cur.shape[1], cur.shape[2]
-    vv, uu = torch.meshgrid(torch.linspace(-1, 1, H, device=DEV),
-                            torch.linspace(-1, 1, W, device=DEV), indexing="ij")
+    vv, uu = torch.meshgrid(
+      torch.linspace(-1, 1, H, device=DEV),
+      torch.linspace(-1, 1, W, device=DEV),
+      indexing="ij",
+    )
     denom = cnt.clamp(min=1)
     u_c = (mask * uu).sum(dim=(1, 2)) / denom
     v_c = (mask * vv).sum(dim=(1, 2)) / denom
-    print(f"    {d:.1f}m: ball_px={cnt.float().mean().item():6.1f} u={u_c.mean().item():+.2f} v={v_c.mean().item():+.2f}")
+    print(
+      f"    {d:.1f}m: ball_px={cnt.float().mean().item():6.1f} u={u_c.mean().item():+.2f} v={v_c.mean().item():+.2f}"
+    )
     _save_depth_png(cam.data.depth, f"/tmp/smoke_depth/ball_{d:.1f}m.png")
 
   # (c) neck steering: ball fixed at 1.5m, sweep neck (ball-isolated centroid)
   print("(c) neck steering (ball fixed 1.5m ahead, ball-isolated centroid):")
-  for name, yaw, pitch in [("center", 0.0, 0.0), ("yaw+", 0.6, 0.0), ("yaw-", -0.6, 0.0),
-                            ("pitch+", 0.0, 0.4), ("pitch-", 0.0, -0.4)]:
+  for name, yaw, pitch in [
+    ("center", 0.0, 0.0),
+    ("yaw+", 0.6, 0.0),
+    ("yaw-", -0.6, 0.0),
+    ("pitch+", 0.0, 0.4),
+    ("pitch-", 0.0, -0.4),
+  ]:
     _set_neck(env, yaw, pitch)
     _place_ball_ahead(env, 50.0)
     _refresh(env)
@@ -147,12 +161,17 @@ def main() -> None:
     mask = (bg - cur) > 0.1
     cnt = mask.float().sum(dim=(1, 2))
     H, W = cur.shape[1], cur.shape[2]
-    vv, uu = torch.meshgrid(torch.linspace(-1, 1, H, device=DEV),
-                            torch.linspace(-1, 1, W, device=DEV), indexing="ij")
+    vv, uu = torch.meshgrid(
+      torch.linspace(-1, 1, H, device=DEV),
+      torch.linspace(-1, 1, W, device=DEV),
+      indexing="ij",
+    )
     denom = cnt.clamp(min=1)
     u_c = (mask * uu).sum(dim=(1, 2)) / denom
     v_c = (mask * vv).sum(dim=(1, 2)) / denom
-    print(f"    {name:7s}: ball_px={cnt.float().mean().item():6.1f} u={u_c.mean().item():+.2f} v={v_c.mean().item():+.2f}")
+    print(
+      f"    {name:7s}: ball_px={cnt.float().mean().item():6.1f} u={u_c.mean().item():+.2f} v={v_c.mean().item():+.2f}"
+    )
     _save_depth_png(cam.data.depth, f"/tmp/smoke_depth/neck_{name}.png")
 
   env.close()
@@ -161,4 +180,3 @@ def main() -> None:
 
 if __name__ == "__main__":
   main()
-

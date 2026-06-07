@@ -49,7 +49,7 @@ def _gt_slices(obs_mgr) -> list[tuple[int, int]]:
   names = obs_mgr.active_terms["actor"]
   dims = obs_mgr.group_obs_term_dim["actor"]
   slices, offset = [], 0
-  for name, shape in zip(names, dims):
+  for name, shape in zip(names, dims, strict=False):
     width = int(torch.tensor(shape).prod().item()) if len(shape) else 1
     if name in GT_BALL_TERMS:
       slices.append((offset, offset + width))

@@ -41,8 +41,9 @@ def main() -> None:
   fig, ax = plt.subplots(figsize=(11, 5.5))
   ax.bar(x - w, WARMUP_BASE, w, label="warmup baseline (GT crutch)", color="#2c7fb8")
   ax.bar(x, WARMUP_ABL, w, label="warmup ablated (CNN dead weight)", color="#bdbdbd")
-  b3 = ax.bar(x + w, V3B_NATIVE, w, label="v3b native (camera only, trained)",
-              color="#31a354")
+  b3 = ax.bar(
+    x + w, V3B_NATIVE, w, label="v3b native (camera only, trained)", color="#31a354"
+  )
 
   ax.set_ylabel("reward / rate (post-settle avg)")
   ax.set_title(
@@ -56,8 +57,10 @@ def main() -> None:
 
   ax.annotate(
     "dribble survives\non camera: 0.01 -> 1.11",
-    xy=(2 + w, 1.11), xytext=(2.3, 3.0),
-    fontsize=9, color="#006d2c",
+    xy=(2 + w, 1.11),
+    xytext=(2.3, 3.0),
+    fontsize=9,
+    color="#006d2c",
     arrowprops=dict(arrowstyle="->", color="#006d2c"),
   )
   fig.tight_layout()

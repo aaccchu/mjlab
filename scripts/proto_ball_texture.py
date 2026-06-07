@@ -23,9 +23,18 @@ def _face_centers():
   phi = (1.0 + 5.0**0.5) / 2.0
   verts = np.array(
     [
-      (0, 1, phi), (0, 1, -phi), (0, -1, phi), (0, -1, -phi),
-      (1, phi, 0), (1, -phi, 0), (-1, phi, 0), (-1, -phi, 0),
-      (phi, 0, 1), (phi, 0, -1), (-phi, 0, 1), (-phi, 0, -1),
+      (0, 1, phi),
+      (0, 1, -phi),
+      (0, -1, phi),
+      (0, -1, -phi),
+      (1, phi, 0),
+      (1, -phi, 0),
+      (-1, phi, 0),
+      (-1, -phi, 0),
+      (phi, 0, 1),
+      (phi, 0, -1),
+      (-phi, 0, 1),
+      (-phi, 0, -1),
     ],
     dtype=np.float64,
   )
@@ -72,11 +81,11 @@ def _cube_face_dirs(face, n):
   ones = np.ones_like(uu)
   # MuJoCo cube face order: right, left, up, down, front, back (+x,-x,+y,-y,+z,-z).
   faces = {
-    0: (ones, -vv, -uu),   # +x
-    1: (-ones, -vv, uu),   # -x
-    2: (uu, ones, vv),     # +y
-    3: (uu, -ones, -vv),   # -y
-    4: (uu, -vv, ones),    # +z
+    0: (ones, -vv, -uu),  # +x
+    1: (-ones, -vv, uu),  # -x
+    2: (uu, ones, vv),  # +y
+    3: (uu, -ones, -vv),  # -y
+    4: (uu, -vv, ones),  # +z
     5: (-uu, -vv, -ones),  # -z
   }
   x, y, z = faces[face]
@@ -116,14 +125,10 @@ def main():
 
   spec.worldbody.add_light(pos=(0.3, 0.3, 0.5), dir=(-0.3, -0.3, -0.5))
   b = spec.worldbody.add_body(name="ball", pos=(0, 0, 0))
-  b.add_geom(
-    type=mujoco.mjtGeom.mjGEOM_SPHERE, size=(0.11, 0, 0), material="ball_mat"
-  )
+  b.add_geom(type=mujoco.mjtGeom.mjGEOM_SPHERE, size=(0.11, 0, 0), material="ball_mat")
   # Camera at +x looking back toward the origin: z_cam=+x so -z_cam=-x points at
   # the ball. xyaxes = (x_axis=(0,1,0), y_axis=(0,0,1)) -> z = x_axis X y_axis = +x.
-  cam = spec.worldbody.add_camera(
-    name="cam", pos=(0.45, 0, 0), xyaxes=(0, 1, 0, 0, 0, 1)
-  )
+  spec.worldbody.add_camera(name="cam", pos=(0.45, 0, 0), xyaxes=(0, 1, 0, 0, 0, 1))
 
   model = spec.compile()
   data = mujoco.MjData(model)

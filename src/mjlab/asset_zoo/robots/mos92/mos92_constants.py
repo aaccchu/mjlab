@@ -125,8 +125,12 @@ KNEES_BENT_KEYFRAME = EntityCfg.InitialStateCfg(
     ".*hip_pitch": -0.2,
     ".*knee": 0.4,
     ".*ankle_pitch": -0.2,
-    "left_shoulder_roll": 1.4,
-    "right_shoulder_roll": -1.4,
+    # Arms hang naturally at the sides. Small outward abduction (~9deg) keeps the
+    # hands clear of the thighs during leg swing (avoids hand<->thigh self-
+    # collision) while reading as "arms down", not the prior ±1.4rad (±80deg)
+    # T-pose that the pose reward was rewarding. See mos92_arms_out_keyframe note.
+    "left_shoulder_roll": 0.15,
+    "right_shoulder_roll": -0.15,
   },
   joint_vel={".*": 0.0},
 )

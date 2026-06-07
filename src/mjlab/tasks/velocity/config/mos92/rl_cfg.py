@@ -21,6 +21,14 @@ _VISION_CNN_CFG = {
 }
 _VISION_MODEL_CLS = "mjlab.rl.spatial_softmax:SpatialSoftmaxCNNModel"
 
+# RGB self-localization CNN (v3g Phase B/C). Same spatial-softmax shape as the
+# depth branch (=> 64-d latent), but a SEPARATE branch so the validated
+# depth-ball CNN is untouched: depth stays dedicated to the ball, RGB carries
+# self-localization from the painted field lines/goal. The model builds one CNN
+# per 2-D image obs group; passing cnn_cfg as a dict-of-dicts keyed by group
+# name gives each branch its own config.
+_RGB_CNN_CFG = dict(_VISION_CNN_CFG)
+
 
 def mos92_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
   return RslRlOnPolicyRunnerCfg(
@@ -108,3 +116,23 @@ def mos92_vision_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
       "critic": ("critic",),
     },
   )
+
+
+def mos92_selfloc_vision_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
+  """v3g Phase B/C: depth-ball CNN + a SECOND RGB CNN for self-localization.
+
+  Adds a "camera_rgb" image obs group to the actor. The spatial-softmax model
+  builds one CNN per 2-D group, so cnn_cfg is a dict-of-dicts keyed by group
+  name: "camera" (depth, 1ch) keeps the validated ball CNN, "camera_rgb"
+  (rgb, 3ch) is a fresh branch whose 64-d latent appends to the actor obs. Both
+  latents concatenate onto the 1-D obs before the MLP trunk. Critic stays a pure
+  MLP on GT-only obs (asymmetric) — unchanged from the rebalanced bootstrap.
+  """
+  cfg = mos92_vision_ppo_runner_cfg()
+  assert cfg.actor.cnn_cfg is not None
+  cfg.actor.cnn_cfg = {"camera": _VISION_CNN_CFG, "camera_rgb": _RGB_CNN_CFG}
+  cfg.obs_groups = {
+    "actor": ("actor", "camera", "camera_rgb"),
+    "critic": ("critic",),
+  }
+  return cfg

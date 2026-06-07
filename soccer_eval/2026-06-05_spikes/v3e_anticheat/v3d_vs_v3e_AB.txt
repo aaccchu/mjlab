@@ -1,0 +1,17 @@
+================================================================
+metric                             v3d         v3e       delta
+----------------------------------------------------------------
+dribble_success                 2.4410      2.4599      0.0190
+ball_trapped_frac               0.0000      0.0000      0.0000
+holding_ball_frac               0.2971      0.2267     -0.0703
+illegal_contact_frac            0.0001      0.0004      0.0003
+ball_sticking_frac              0.0013      0.0045      0.0032
+ball_under_robot_frac           0.6209      0.7945      0.1737
+holding_time_mean               1.2177      0.9169     -0.3009
+ball_speed_mean                 0.3418      0.3697      0.0279
+mean_abs_shoulder_roll          1.2908      0.2604     -1.0304
+gaze_center                     0.0315      0.0376      0.0061
+upright                         0.9871      0.9869     -0.0002
+================================================================
+WANT: ball_under_robot & holding_time DOWN (anti-cheat), shoulder_roll
+      DOWN (arms drop), dribble_success roughly held (skill survived).

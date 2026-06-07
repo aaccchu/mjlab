@@ -88,7 +88,9 @@ def main() -> None:
   print("[INFO] Actor (CNN) + critic loaded strict; GT mask pinned to 0.")
 
   mode = "SMOKE" if smoke else "FULL"
-  print(f"[INFO] Task B jump-fix [{mode}]: {max_iter} iters, envs={env_cfg.scene.num_envs}")
+  print(
+    f"[INFO] Task B jump-fix [{mode}]: {max_iter} iters, envs={env_cfg.scene.num_envs}"
+  )
   print("[INFO] watch Metrics/flight_phase_frac -> 0 while dribble/gaze/upright hold.")
   runner.learn(num_learning_iterations=max_iter, init_at_random_ep_len=True)
 

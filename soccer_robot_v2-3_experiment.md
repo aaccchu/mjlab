@@ -822,4 +822,519 @@ v3b 验证了 step 3(privileged dropout)可行 —— CNN 能在 GT 去除下承
 - 提醒:dribble 1.11 是「最小消融 + 静止球 + 保留 command」下的数字,真正纯视觉的
   Goal Rate 需在 step 5 + Spike E 的进球场景里单独评估。
 
+---
+
+## Task A: 球物理标定 + DR + 外观 (2026-06-05 晚) — DONE,全部实跑验证
+
+> 对应 v3 §Stage 2「球 Domain Randomization」+ §Stage 4 外观 DR。目的:让球的
+> 物理/外观尽量接近真实并可随机化,缩小 Sim2Real gap。
+
+**1. 弹性标定(restitution e≈0.35):** MuJoCo 无直接恢复系数。正 solref 封顶 e≈0.25
+(太死);负 solref=(-刚度,-阻尼)才到 RoboCup 级。在真实 timestep(0.005s)用
+`scripts/calibrate_ball_restitution.py` 实测:`solref=(-2300,-32)` → e≈0.35
+(0.31-0.36 over drop 0.3-1.5m)。已确认进编译模型。roll friction 0.01→0.02 加滚动阻力。
+
+**2. 弹性 DR 需要新函数:** mjlab 的 dr 包**没有 solref 随机化**。本会话新增
+`dr.geom_solref`(仿 `dr.geom_friction`,`src/mjlab/envs/mdp/dr/geom.py`)。实测
+stiffness-only(damping 固定 -32)对 e 单调:stiffness [-9000,-1050] → e∈[0.20,0.58],
+覆盖目标 [0.2,0.6](0.6 在此 damping 下封顶 ~0.58,已诚实标注)。
+
+**3. 球 DR(4 个 startup event,逐 env 采样):** radius ±5%(`dr.geom_size`)、
+mass ±15%(`dr.pseudo_inertia`,质量+惯量一致缩放)、slide friction 0.3-0.7
+(`dr.geom_friction`)、elasticity(`dr.geom_solref`)。**实跑验证:** 16 envs 逐
+env stiffness 真实分散 -8744…-1070(std 2650),球 30 步稳定 z∈[0.105,0.115]。
+
+**4. 外观纹理(truncated-icosahedron):** 12 红五边形 + 蓝/白六边形(spherical Voronoi),
+1 块标记六边形用于观测旋转。作为 cube texture 建出,`textured=False` 默认关闭——
+**当前 obs 是 depth-only,纹理只影响 viewer/RGB,对训练零影响**,加 RGB obs 后再开。
+已渲染验证(`scripts/proto_ball_texture.py`)。
+
+**改动文件:** `soccer_field.py`(SoccerBallCfg + 纹理 builder)、`dr/geom.py`+`dr/__init__.py`
+(新增 geom_solref)、`mos92/env_cfgs.py`(4 个 DR event)。
+**脚本:** `calibrate_ball_restitution.py`、`proto_ball_texture.py`。
+
+---
+
+## Task B: 跳跃修复 (2026-06-05 晚) — PASS,但暴露夹球 exploit
+
+> 动机:用户在 v3b 视频里看到机器人**靠跳起来转向**而非迈步。双足步态本应始终
+> 单/双支撑,出现腾空相说明在用跳跃重定向。
+
+**新 reward `flight_phase`:** 双脚同时离地(`feet_ground_contact.found==0` 全 True)
+= 惩罚,`air_time_threshold=0.05` 忽略快速步态切换的瞬时双浮。挂进 base config,
+weight=-1.0,记 `Metrics/flight_phase_frac` 指标。**未加**多余的转向塑形——已有
+`track_angular_velocity`(weight 2.0)会在跳跃被禁后自然驱动迈步转向。
+
+**微调训练(`spike_v3d_jumpfix.py`,从 v3b model_2999 strict bootstrap,1500 iter,
+1024 envs,~32min):** 关键防坑——`gt_mask` 课程的 step 计数在新 run 会**从 0 重启**,
+若照搬 v3b 设置会在前 500 iter **重新引入 GT 拐杖**;故 pin `start_step=-1,end_step=0`
+→ 全程 factor=0,GT 球向量整段保持 mask。
+
+**结果(实测):**
+- `flight_phase_frac`: 0.244(init)→ **~0.01**,全程稳定低位。跳跃被压住。
+- `dribble_success` ≈ 2.0-2.5(训练态),`gaze_center`/`upright` 都没退化。
+- 消融探针(v3d run):baseline≈ablated,确认**仍是纯视觉,未重引入 GT 拐杖**。
+
+**⚠️ 但视频暴露了新问题(夹球 exploit):** v3d 行为视频(全 10s,12 帧跨时间线
+人工查看)显示——跳跃确实没了(每帧双脚着地),**但机器人反复"骑"在球上,球卡在
+胯下/两腿之间**。这正是规则文档里的**规则 2(持球)+ 规则 3(夹球)**。
+- **根因:** 任务只奖励"球到目标 + 接触",**没有任何 penalty 惩罚占有/夹球**。
+  已确认 rewards.py 里 `illegal_body_contact/holding_ball/ball_trapped/...` 6 个规则
+  函数**全部未实现**,mos92 env 也没挂 body↔ball 接触传感器。
+- **结论:** 这不是 bug,是 reward 设计缺口。**只要不惩罚占有,RL 必然学到卡球**——
+  这是教科书级 reward hacking,已写进 v3.md/v2-5.md 规则章节作为实证锚点。
+
+**checkpoint:** `logs/.../2026-06-05_20-46-37_spike_v3d_jumpfix/model_1499.pt`
+**产物:** `soccer_eval/2026-06-05_spikes/v3d_jumpfix/`(视频 + 探针结果)
+
+---
+
+## 旁路发现: 手臂外展根因 (2026-06-05) — 非代码覆盖,是关键帧
+
+用户多次要求手臂自然垂放。实测 `default_joint_pos` 的 shoulder_roll = **±1.400 rad
+(±80°)** —— 机器人用的 `KNEES_BENT_KEYFRAME` 关键帧本身就把手臂设成平举,
+`pose` 奖励(weight 1.0,站立 std 0.05 很紧)每步把手臂拉向这个默认位 → **策略被
+主动奖励去举手**。另有未使用的 `HOME_KEYFRAME`(全 0,手臂垂下)。
+- 诚实说明:**无法用 git 证明是否"被后来覆盖"**——该目录不是 git 仓库。
+- 修复:`KNEES_BENT_KEYFRAME` 的 shoulder_roll ±1.4→~0,**需重训**(当前策略按 ±1.4
+  训出);最省做法是并进下一次重训。已存记忆 `mos92_arms_out_keyframe.md`。
+
+---
+
+## Task v3e: 反作弊规则 + 手臂修复 (2026-06-05 夜, 无人值守) — 部分成功
+
+> 动机:v3d 视频暴露"骑球/卡球" exploit(规则2持球+规则3夹球)。本次实现完整反作弊
+> 基础设施并从 v3d 微调,同时并入手臂关键帧修复。对应 v3.md §2 全部 6 类违规中的 1-4 条。
+
+**实现(全部本会话新建,已 smoke 验证 penalty 真触发):**
+- `DribbleCommand` 新增 metrics:`ball_speed`、`holding_time`、`ball_stuck_time`(逐步累积+条件断开即清零)
+- 新 `body_ball_contact` 传感器:`mode="body"` 匹配全部非脚身体(排除 Rfoot/Lfoot/Rankle/Lankle),
+  实测解析到 17 个非脚 body。`illegal = body接触 ∧ ¬脚接触`
+- rewards.py 新增 4 个 penalty:`illegal_body_contact`(-1.0)、`ball_trapped`(-3.0,最重)、
+  `holding_ball`(-2.0)、`ball_sticking`(-1.0),各自写 `Metrics/*_frac` 日志
+- `penalty_weight_curriculum`:factor 0.2→1.0 over iter 100-700(Spike-C:满强度从 0 起会
+  让"不碰球最安全",带球崩)。实测 penalty_factor 末期=1.0
+- 关键帧:`shoulder_roll` ±1.4→±0.15(留 9° 余量防手↔大腿自碰),手臂自然垂放
+- 安全防坑:`gt_mask` pin 到 factor=0(start=-1,end=0),微调不重引入 GT 拐杖
+
+**训练:** 从 v3d `model_1499` strict bootstrap,3000 iter,1024 envs,~60min,跑满 2999。
+
+**验证(全部实跑,无编造):**
+
+*1. 纯视觉探针(在 v3e 上重跑 probe,256 envs):*
+- ablated(GT=0,训练态)dribble_success **1.82** vs baseline(GT 完整,OOD)0.06,
+  gaze_center ratio ~1.3 → **GT obs 惰性,仍是纯视觉,未重引入拐杖** ✓
+
+*2. v3d vs v3e A/B(同一反作弊插桩 env,256 envs×450 步,均逐步清零 GT —— 唯一公平对照,
+因为 v3d 训练期根本没记这些指标):*
+
+| 指标 | v3d | v3e | delta | 判读 |
+|------|-----|-----|-------|------|
+| dribble_success | 2.44 | 2.46 | +0.02 | **技能保住** ✓ |
+| mean_abs_shoulder_roll (rad) | 1.29 | **0.26** | **-1.03** | **手臂垂下,决定性** ✓ |
+| holding_ball_frac | 0.297 | **0.227** | -0.07 | 持球降 24%,真实但**仍偏高** |
+| holding_time_mean (s) | 1.22 | 0.92 | -0.30 | 平均持球时长降 25% ✓ |
+| ball_trapped_frac | 0.000 | 0.000 | 0 | 严格夹球(双接触)两者都≈0 |
+| ball_under_robot_frac | 0.62 | 0.79 | +0.17 | **升**(张力,见下) |
+| ball_speed_mean (m/s) | 0.34 | 0.37 | +0.03 | 球更动,非停住 |
+| upright | 0.987 | 0.987 | 0 | 稳 ✓ |
+
+**诚实结论:部分成功,喜忧参半。**
+- **手臂修复:决定性成功。** shoulder_roll 从 1.29rad(~74°)→0.26rad(~15°),动态带球时也保持。
+- **技能保住:** dribble_success 持平,upright 稳,纯视觉未退化。
+- **反作弊:真实但不彻底。** v3d 的 exploit 主要是**持球(holding,球近+慢+持续~30%步)**,
+  而非严格**夹球(trapped,双接触+静止)**——后者两模型都≈0。v3e 把 holding 降了 24%、
+  平均持球时长降 25%,方向对,但 holding 仍有 23%。
+- **关键张力:`ball_under_robot` 反而升(0.62→0.79)。** 诚实解读:这个代理指标**无速度门控**,
+  把"贴身紧密控球(球在动)"和"卡住球(球停)"混为一谈。v3e 的 ball_speed 实际更高(球一直在动),
+  说明它是把球控得**更近但仍在推进**,不是停球占有。所以 under 升 ≠ 作弊变多;它暴露了这个
+  代理指标本身不够精确(precise penalty fractions 才是准的,见上表)。
+- **早先用 3 帧静图判"手臂又甩出去"是误判**:那是 shoulder-*pitch* 自然摆臂平衡,不是 fix 针对的
+  *roll* 外展。256env×450步的 0.26rad 测量是权威。
+
+**产物:** `soccer_eval/2026-06-05_spikes/v3e_anticheat/`(视频 + 探针结果)。
+**checkpoint:** `logs/.../2026-06-05_22-43-22_spike_v3e_anticheat/model_2999.pt`
+**脚本:** `spike_v3e_anticheat.py`、A/B 对照 `eval_v3d_vs_v3e.py`(同 env 双 checkpoint)。
+**下一步:** holding 仍 23% 偏高 → 加强 holding 惩罚(权重或降阈值)再微调一轮(见 v3f)。
+
+---
+
+## Task v3f: 加强持球惩罚 (2026-06-06 凌晨, 无人值守) — 成功,本夜最佳模型
+
+> 动机:v3e 的 A/B 显示残留 exploit 主要是**持球(holding 23%)**而非夹球。v3f 从 v3e
+> 微调,只动 holding 惩罚:weight -2.0→-3.0(等于夹球,最重),阈值 1.5s→1.0s(更严但仍在
+> 文档 1-2s 范围内,不误杀踢球间隙)。其余与 v3e 完全相同。1500 iter,从 v3e bootstrap。
+
+**监控到的风险与化解:** 脚本里预判"惩罚过猛→机器人躲球→dribble 崩"。早期 iter47 dribble_success
+确实掉到 0.07 —— 但这是微调初期暂态,iter186 已恢复到 3.0,**未发生躲球**。penalty_factor 末期=1.0。
+
+**验证(全部实跑):**
+
+*1. 纯视觉探针:* ablated(GT=0,训练态)dribble_success **1.82** vs baseline(OOD)0.19,
+GT obs 惰性 → **仍纯视觉,无拐杖** ✓
+
+*2. v3d/v3e/v3f 三方 A/B(同一插桩 env,256envs×450步,逐步清零 GT —— 公平对照):*
+
+| 指标 | v3d | v3e | v3f | 趋势 |
+|------|-----|-----|-----|------|
+| dribble_success | 2.41 | 2.52 | **2.60** | ↑ 技能反升 ✓ |
+| holding_ball_frac | 0.292 | 0.219 | **0.137** | ↓ **比 v3d 降 53%** ✓ |
+| holding_time_mean (s) | 1.17 | 0.90 | **0.61** | ↓ 持续下降 ✓ |
+| ball_trapped_frac | 0.000 | 0.000 | 0.000 | 严格夹球始终≈0 |
+| ball_under_robot_frac | 0.63 | 0.81 | **0.74** | v3e 升后 v3f 拉回 |
+| ball_speed_mean (m/s) | 0.35 | 0.38 | **0.39** | 球更动(非停球) |
+| mean_abs_shoulder_roll (rad) | 1.29 | 0.26 | **0.20** | ↓ 手臂垂下 ✓ |
+| mean_abs_shoulder_pitch (rad) | 0.30 | 0.27 | 0.32 | ≈持平(见下) |
+| gaze_center | 0.030 | 0.035 | **0.058** | ↑ |
+| upright | 0.983 | 0.986 | **0.992** | ↑ 最稳 ✓ |
+
+**结论:成功。v3f 是本夜最佳模型** —— holding 比 v3d 降 53%(0.29→0.14)、平均持球时长降 48%,
+同时 dribble_success 反升到 2.60、upright 最高、纯视觉保持。over-penalty 风险未兑现。
+
+**关于手臂的诚实修正:** v3f 视频帧里中段仍见手臂**上举**。深查发现这是 shoulder-**pitch**
+(前向/上摆),不是关键帧 fix 针对的 shoulder-**roll**(侧向外展/T-pose)。量化:三个模型
+pitch 都 ~0.3rad(~17°)基本持平 → 上举是**动态平衡的瞬时峰值**,非持久姿态;而 roll(持久的
+T-pose 外展)已从 74°→11° 彻底修好。**早先 A/B 只测了 roll,漏看 pitch,本轮补测纠正。**
+若要进一步压低摆臂,需对 shoulder_pitch 加 pose/动作惩罚,留作后续。
+
+**产物:** `soccer_eval/2026-06-05_spikes/v3f_holding/`(视频+探针+三方A/B)。
+**checkpoint:** `logs/.../2026-06-06_00-09-22_spike_v3f_holding/model_1499.pt`(**当前最佳**)
+**脚本:** `spike_v3f_holding.py`、三方对照 `eval_v3d_vs_v3e.py`。
+
+---
+
+## Task v3g-S1: RGB 自定位可见性 GATE (2026-06-06 上午) — PASS
+
+> v3g 目标:纯 RGB 视觉自定位 + 深度测球(用户确认:加 RGB 相机 + 特权→蒸馏)。
+> 训练前的科学纪律:先证明信号存在,再训练(同深度探针做法)。
+
+**关键约束(实测):** 现有头部相机 depth-only;球场线/中圈/罚球点是平面贴花 geom(z≈0)
+**深度完全看不见**;球门柱 3D 但 0.1m@10m 不足 1 像素。→ 深度无法自定位,必须用 RGB。
+
+**踩坑修正:** 初版探针 5 个位姿渲染出**完全相同**的图(marking 比例全等)。根因:相机渲染
+触发是 `env.sim.sense()`,不是 `sim.forward()`——teleport 后只 forward 没 sense,视图不刷新。
+修正为 `forward(); sense()` 后,5 个位姿产生真实差异。**诚实记录:不查这个 bug 会得出错误 GATE 结论。**
+
+**结果(`scripts/probe_rgb_field.py`,3 档分辨率 × 5 位姿,marking 像素比例 + 人工看图):**
+- 面向球门的位姿过线:midfield 2.4%、near_opp_goal 2.4%(64×48)→ 5.7-6.0%(96×72/128×96)
+- 面向空场/背向的位姿 LOW(0.3-0.5%)——物理合理:视野无地标时 marking 自然稀疏
+- **人工看图确认:** near_opp_goal 渲出**清晰球门矩形+门柱+罚球区白线**;corner 渲出绿场+
+  零散白线段+红色球点。**深度绝无可能渲出这些。**
+- **96×72 明显比 64×48 信息更丰**(面向球门 5.7% vs 2.4%)→ 自定位相机建议用 96×72。
+
+**GATE 结论:PASS。RGB 确实能看见球场地标,是自定位的正确模态。** 可进入 Phase A(特权自定位闭环)。
+**产物:** `soccer_eval/2026-06-06_spikes/v3g_rgb_probe/`(15 张渲染图)。**计划:** `soccer_robot_v3g_plan.md`。
+
+---
+
+## Task: 手臂不过肩 — shoulder_roll 动作硬限位 (2026-06-06 上午, 代码就绪未训)
+
+> 用户需求:手臂保留用于平衡(**不冻结**),但要像人一样放在两侧、**不高于肩**。
+
+**重要更正(推翻 v3f 记录里的结论):** 之前 v3f 段说"手臂上举是 shoulder-**pitch**",
+**错了**。单关节扫角精确实测(手相对肩的 z 高度):
+- **pitch** 扫 −1.5→+2.0:手 z 几乎不动(±0.006 m)→ pitch 只让手臂**前后摆**(平衡要用)。
+- **roll** 扫 −1.4→+1.4:手 z 变化 **0.32 m** → roll 才是**侧向抬手**、决定高不高于肩的 DOF。
+
+**标定数值(站立单关节,手 z vs 肩 z + 手-大腿间距):**
+- 右臂 roll default −0.15 = 正好肩高;>−0.15 抬过肩;−0.6 时手低于肩 0.067m、离大腿 0.29m(不自碰)。
+- 左臂镜像(default +0.15 = 肩高)。
+
+**实现:** 在 mos92 base velocity env 给 `joint_pos_action.clip` 加 per-joint 硬限位
+(clip 作用于绝对关节目标弧度,因 `use_default_offset=True`):
+- `right_shoulder_roll: (-0.6, -0.15)`、`left_shoulder_roll: (0.15, 0.6)`
+- **pitch / elbow 不限**(保留前后摆臂用于动态平衡 —— 用户明确要求)。
+
+**Smoke 验证(实跑):** clip 已挂载(shape (envs,20,2));给右 roll 发 +100 抬手指令 →
+目标被钳到 **−0.15**(肩高);给 pitch 发 +100 → 19.08 不钳(摆臂自由)。硬保证成立,非软惩罚。
+
+**诚实局限:** 静态单关节标定;动态踢球是 pitch+roll+elbow 组合,过肩可能还有 elbow 贡献,
+clip 住 roll 上限挡住主要侧抬,彻底与否需实跑视频确认。**需重训生效**(action 空间语义变),
+当前 v3g Phase A 仍在跑,故只改代码+验证,未启动训练。**脚本:** `env_cfgs.py` 第 101-118 行。
+
+---
+
+## Task v3g Phase A 收尾: 自定位探针 (2026-06-06 中午) — 结论:策略**没有**真正依赖自定位
+
+> Phase A 训练完成(model_1999,2000 iter,训练日志 dribble_success 稳态~1.1)。收尾必须
+> 验证:策略到底有没有用 `robot_field_pose` 来瞄准球门,还是找了别的捷径绕过去。
+
+**探针踩坑(已修):** 初版探针 baseline dribble_success=0.002(≈0,和训练的~1.1 矛盾)。根因:
+selfloc env 的 `gt_mask` 课程在 play 模式停在 factor=1.0,于是策略收到**非零的 GT 球 obs,
+而它被训练成"看到这些是 0"** → OOD 输入冲击,行为崩坏。修正:探针在**两个 pass 都把 GT 球项清零**
+(复现训练的纯视觉条件),只单独变动 `robot_field_pose`。修后 baseline 恢复正常(upright 0.999)。
+
+**探针结果(修正版,256envs×600步,只变动 field_pose):**
+
+| 指标 | baseline(field_pose 在) | ablated(field_pose 清零) | ratio |
+|------|------|------|------|
+| dribble_success | 0.2294 | 0.2128 | **0.93** |
+| ball_to_target_error (m) | 1.97 | 1.99 | 1.01 |
+| upright | 0.999 | 0.999 | 1.00 |
+
+**诚实结论:清零自定位只让 dribble_success 掉 7% → 策略基本没在用 `robot_field_pose`。**
+Phase A 的目标("强制策略靠自定位推断球门方向")**没达成** —— 策略找了捷径绕过自定位。
+
+**最可能的原因(待验证):** dribble 任务的几何让"球门方向"无需绝对场上位姿就能推断 —— 机器人
+初始大致朝球门、目标在 +x 方向,"把球往前推"就近似对了。**没有任何东西强制它用 field_pose。**
+要让自定位变成必需,任务得在**多样化的初始位置/朝向**下生成,使球门方向真正依赖于场上位姿。
+
+**这是个有价值的负结果**,直接决定下一步:不能直接进 Phase B 加 RGB —— 得先让任务**需要**自定位,
+否则给 RGB CNN 蒸馏一个策略根本不用的信号,是空中楼阁。**产物:** `scripts/probe_v3g_selfloc.py`。
+
+---
+
+## Task v3g Phase A-explicit: 显式自定位 head + 误差奖惩 (2026-06-06 下午) — 代码就绪,smoke 通过
+
+> 动机:上面 Phase A 的负结果。用户明确"判断是否准确需要有奖励和惩罚"——要的是**显式**的
+> 自定位估计输出 + 对估计准度的直接奖惩,不是原计划的隐式蒸馏。本轮做几何修复 + 显式 head。
+
+**确诊根因(读代码,非猜测):** selfloc env 继承链 `selfloc←vision_ablation←vision←search←base`
+**没有任何一处设 `goal_target_fraction`**,取默认 `0.0`。于是 dribble 目标是离球 2-6m 的**随机点**,
+不是球门。知道自身场上位姿对随机点方向毫无帮助——只有目标是**固定地标**(球门 x=+11)时自定位
+才有用。所以自定位在原任务里**构造上不可学**,清零 field_pose 只掉 7% 是必然。
+
+**实现(全部本会话,smoke 实跑验证):**
+- **几何修复**:`mos92_soccer_selfloc_env_cfg` 设 `goal_target_fraction=1.0` + `target_dist_range
+  =(1.0,3.0)`,目标永远是球门;保持继承的大范围初始位姿随机化(base reset_base yaw ±π+全场 xy,
+  链上未改)。这是负结果的根因修复。
+- **显式自定位 head**:新建 4 维 no-op `SelfLocAction`/`SelfLocActionCfg`
+  (`envs/mdp/actions/actions.py`)。策略输出对自身 `[x_n,y_n,sinθ,cosθ]` 的估计,`apply_actions`
+  是 no-op 不驱动 sim;`raw_action` 供 reward 读、经已有 `"actions"` obs term(`last_action`)
+  自动回传策略(20→24)。注册 `cfg.actions["selfloc"]`(插在 joint_pos 之后,电机切片不变)。
+- **误差奖惩**(`velocity/mdp/rewards.py`):`selfloc_accuracy`(exp(-err/std²),pos/head 分项,
+  weight +1.5,记 `Metrics/selfloc_pos_err_m` 米制)+ `selfloc_error_penalty`(原始 L2,weight −0.5,
+  线性,大误差持续受罚——exp kernel 在大误差处饱和,线性项才真正满足"估错给罚")。
+- **维度账(env 实例化实测确认)**:actor 1D obs 85→89,mlp.0 in 148→153,输出 20→24,
+  `distribution.std_param` (20)→(24)。**critic 也变宽**:`"actions"` 同在 critic 组,
+  obs 94→98,mlp.0 in 94→98(输出仍 1)。
+- **partial-load 修正(实测推翻原计划)**:原计划以为 critic 可 strict load,**错**——critic 输入
+  也变了。改用**通用 shape-match partial-load**(actor+critic 都只保留 shape 不变的张量,
+  自动跳过 input/output/normalizer/std_param)。smoke 实测:actor loaded 12/reinit 7
+  (3 normalizer+std_param+mlp.0.w+mlp.6.w/b),critic loaded 8/reinit 4(3 normalizer+mlp.0.w),
+  深层 MLP+depth-ball CNN 全部承接。
+- **PPO 风险已查**:`std_type` 配置标量但 ckpt 里 std_param 实为 per-dim (20,);cognitive 维
+  与电机共享探索噪声(这正是它探索估计值所需),partial-load 重置成 (24,) 无碍。
+
+**Smoke 验证(`--smoke` 8 iter,32 env,实跑 exit 0):** 无 NaN;action dim=24(joint_pos 20
++selfloc 4);两个 selfloc reward 都触发(`selfloc_error_penalty` 从 iter1 给梯度,
+`selfloc_accuracy` 估计未标定前≈0,符合设计);partial-load 打印正确。**未达标项诚实记录**:
+smoke 仅 8 iter,`selfloc_pos_err_m` 还在 ~35m(全新未标定 head),标定下降要看全量 2000 iter。
+
+**代码质量**:5 个改/新文件 ruff+ty 全清。`make check` 余 38 个 ty diagnostics 全为**预存**
+(soccer_field.py mujoco add_geom stub 类型 + rewards.py 三个旧 anti-cheat 函数的 cmd.metrics 警告),
+非本轮引入,未动。
+
+**张力提示(诚实):** Phase A GT `robot_field_pose` 仍在 obs 里,估计可"抄"GT 满足 accuracy
+reward——这只是 sanity(证 head+reward+几何管线对)。**自定位真本事看 Phase C**:mask 掉 GT
+field_pose(hook 是 `_SELFLOC_MASK_START/END_ITER` 常量)后估计只能从视觉来。需先接 RGB
+(S1 已证唯 RGB 能看见球场线,depth 看不见)。
+
+**产物/脚本**:`spike_v3g_selfloc_explicit.py`(actor+critic shape-match partial-load)、
+`probe_v3g_selfloc_explicit.py`(双消融:① 标定精度 estimate-vs-GT 米/度;② 清零估计回传看
+goal-dribble 是否崩→证估计真被用)。**下一步**:全量训练 2000 iter,跑探针验标定下降+估计被用。
+
+### 全量训练结果 (2026-06-06 下午, 2000 iter, 1024 env, ~40min) — 自定位成功,带球崩塌(reward 失衡)
+
+**训练态(model_1999):**
+- **自定位学会了**:`selfloc_accuracy` reward **1.11**(接近 1.5×exp 上限)、`selfloc_pos_err_m`
+  从 18m(iter96)→ **1.42m**、`upright` 0.87、`fell_over` 仅 0.32(站得很稳)。
+- **但带球崩了**:`dribble_to_target`≈0.0005、`ball_path_length` 0.44m、`ball_speed` 0.05、
+  `dribble_success` 全程 **0.0**。机器人几乎不带球。
+
+**探针(model_1999,256env×600步,三消融):**
+
+| 指标 | baseline | −estimate | −GT_pose |
+|------|------|------|------|
+| dribble_success | 0.0000 | 0.0000 | 0.0000 |
+| selfloc_pos_err_m | **0.567** | 0.576 | 5.381 |
+| selfloc_head_err_deg | **2.64** | 2.39 | 91.85 |
+| upright | 0.988 | 0.989 | 0.989 |
+
+**诚实结论:**
+1. **自定位管线完全打通,标定精准**:baseline 位置误差 0.57m、朝向误差 2.6° —— 显式 head +
+   误差奖惩的设计**奏效**,这是本轮的核心成果。
+2. **估计目前靠"抄"GT**:`−GT_pose` 消融后误差暴涨到 5.4m/92° —— 估计依赖 obs 里的 GT
+   field_pose,GT 一清零就估不准。**这正是计划里预警的 Phase A 张力**(GT 在 obs 里时估计可走
+   捷径),不是 bug,是 Phase A 的预期局限。真正的视觉自定位要等 Phase C(mask GT + 接 RGB)。
+3. **`−estimate` 消融无法判定**:`dribble_success` 三态全 0 —— 因为机器人根本不带球,没有带球
+   行为可供"崩溃",这个消融此轮失去意义。
+4. **根因:reward 失衡(教科书级,非自定位之过)**。机器人发现"站稳 + 准报位置"稳拿
+   `selfloc_accuracy`(1.11)+`upright`(0.87)≈2 分,比"辛苦带球穿越大半场到固定球门"(难且稀疏)
+   划算太多,于是**理性放弃主任务**。几何修复(目标永远是固定球门 + 全场随机出生)同时让带球
+   任务变难,放大了这个失衡。
+
+**下一步(待定方向):**
+- **修 reward 平衡**:降 `selfloc_accuracy` 权重(1.5→~0.3)或对其加"仅在带球进展时才给"的
+  门控(类似 gaze_center 的可见性门控),让自定位成为带球的辅助而非替代;同时可能要从 v3f
+  bootstrap 时先保住带球技能(本轮 reinit 了 mlp.0/mlp.6,带球策略其实被部分打散重学)。
+- **或调几何难度**:`target_dist_range` 进一步收短、或初始位姿不要全场而是限制在进攻半场
+  (类似 goal env 的 spawn),让带球到球门可达,主任务能拿到分再谈平衡。
+- 这些都需重训,留作下一轮决策。
+
+### Reward 平衡重训 (2026-06-06 下午, 2000 iter) — 带球恢复,但 success 仍 0,消融再次无法判定
+
+> 动机:上轮 1.5/−0.5 失衡让机器人"站着报位置"躺平,带球全崩。本轮两改:① `selfloc_accuracy`
+> 1.5→**0.3**、penalty −0.5→**−0.3**(自定位降为辅助 shaping,不与带球争);② spike 脚本
+> partial-load 改"行前缀拷贝"——`mlp.6`/`std_param` 输出层前 20 行(电机,joint_pos 在前)从 v3f
+> 拷入、仅后 4 行(selfloc)fresh,保住 v3f 学会的踢球电机映射(上轮整层 reinit 把带球打散了)。
+
+**训练态(model_1999)对比上轮:**
+
+| 指标 | 上轮(1.5/−0.5) | 本轮(0.3/−0.3) | 解读 |
+|------|------|------|------|
+| dribble_approach | 0.21 | **0.71** | 大幅靠近球 ✓ |
+| dribble_to_target | 0.0005 | **0.081** | 带球向目标(×160) ✓ |
+| ball_path_length | 0.44m | **4.24m** | 球真在动(×10) ✓ |
+| ball_speed | 0.05 | **0.49** | 带球速度起来 ✓ |
+| dribble_success | 0.0 | **0.0** | 仍未进球门 ✗ |
+| selfloc_pos_err_m(训练态) | 1.42 | 5.30 | 标定让位带球(探针更准) |
+
+**探针(model_1999,256env×600步,三消融):**
+
+| 指标 | baseline | −estimate | −GT_pose |
+|------|------|------|------|
+| dribble_success | 0.0000 | 0.0023 | 0.0006 |
+| selfloc_pos_err_m | **1.514** | 2.188 | 5.688 |
+| selfloc_head_err_deg | **5.02** | 5.79 | 84.76 |
+| upright | 0.999 | 0.999 | 0.999 |
+
+**诚实结论:**
+1. **reward 平衡修复成功**:带球从"完全不动"恢复到"主动追球(approach 0.71)+ 推球 4.24m
+   (ball_speed 0.49)"。降权重 + 保住 v3f 电机头两个改动都奏效。
+2. **自定位标定基本保住**:探针 baseline 1.51m/5.0°(上轮 0.57m/2.6°)。降权重只让标定从亚米级
+   退到 1.5m 级,自定位能力没丢。
+3. **估计仍靠抄 GT**:`−GT_pose` 消融误差暴涨 5.7m/85°(同上轮)。Phase A 预期张力,要 Phase C
+   mask GT + 接 RGB 才能破。
+4. **关键问题第二次无法判定**:`−estimate` 消融 dribble_success 0.0000→0.0023,几乎没变 ——
+   **但根因是 baseline 的 dribble_success 本身≈0**(带球够推球但不够送进固定球门),没有"成功"
+   行为可供崩溃。带球恢复了,却没强到能进球门,所以"估计是否用于瞄准"仍证不了。
+
+**根因分析:dribble_success=0 的真凶是几何太难,不是 reward 了。** 几何修复(目标永远固定球门
+x=+11 + 初始位姿**全场**随机)意味着机器人常从场地远端/背对球门出生,要带球穿越大半场+转向才能
+进球门 —— 对一个刚重学输入映射的策略太难。带球能力(approach/path_length)已恢复,差的是"能
+带到那么远的固定球门"。
+
+**下一步(明确指向几何,非 reward):**
+- **收窄初始位姿到进攻半场 + 面向球门**(类似 goal env 的 `spawn_x=half_length-[2.5,5]`、
+  `yaw=(-0.6,0.6)`),让带球到球门**可达**,dribble_success 拿到非零值。这样 `−estimate` 消融才
+  有"成功"可崩,才能终于判定估计是否被用于瞄准。
+- 但注意:窄初始位姿会**削弱自定位的必要性**(位姿不够多样,球门方向又近似 +x)——这正是最初
+  Phase A 失败的几何。**取舍**:可先用"中等"随机(进攻半场但 yaw 全 ±π,强迫转向找球门),
+  在"带球可达"与"自定位必需"之间找平衡。需下一轮重训验证。
+
+### Phase B+C: 双 CNN(深度球 + RGB 定位) + GT 渐隐课程 (2026-06-06 晚, 2000 iter) — 纯视觉自定位失败(负结果)
+
+> 用户要求直接做 Phase B(接 RGB)+ Phase C(mask GT 逼纯视觉)。一次性实现:
+> ① **双 CNN 架构**(查代码确认 spatial-softmax 模型按 obs 组 tensor rank 自动建 CNN,4-D 组→CNN,
+>    传 cnn_cfg dict-of-dicts 按组名给各分支独立配置)。深度 CNN 专管球(不动),新增 fresh RGB CNN
+>    专管定位。head_cam data_types 加 rgb,新增 camera_rgb obs 组(3,48,64),actor obs_groups 加它。
+> ② **Phase C 课程**:`selfloc_gt_mask` curriculum 把 GT robot_field_pose obs(仍在 ball_to_target 键下)
+>    scale 从 1→0 渐隐于 iter[400,1200]。关键设计:selfloc_accuracy reward 比对的 GT 是每步从真实
+>    state 现算的,**不受 obs mask 影响**,所以老师信号在 obs 渐隐后仍在 → 逼策略改用 RGB CNN。
+> ③ **partial-load 最干净**:从 rebalanced model_1999 bootstrap(已有 selfloc head,动作维不变),
+>    actor 仅 mlp.0 reinit(input 153→217 加 64 维 RGB latent)+ RGB CNN fresh;深度 CNN/MLP 主干/
+>    selfloc head/std_param 全留;critic 纯 MLP 完全不变(loaded 12 reinit 0)。smoke 实测确认。
+
+**训练态 selfloc_pos_err_m 全程轨迹(行号≈iter):**
+
+| iter | GT 状态 | pos_err_m | 解读 |
+|------|------|------|------|
+| 150 | 全在 | 9.6 | 初始重学 |
+| 400 | 全在→开始渐隐 | 6.8 | 学到 ~7m(比纯 explicit 1.5m 差,因 mlp.0 reinit) |
+| 1200 | 渐隐完→全 0 | **8.4** | **GT 抽走后不降反升** |
+| 2000 | 全 0 | 7.8 | 横住,无恢复迹象 |
+
+**探针(model_1999,256env×600步,三消融):**
+
+| 指标 | baseline | −estimate | −GT_pose |
+|------|------|------|------|
+| selfloc_pos_err_m | 4.62 | 2.19 | **5.43** |
+| selfloc_head_err_deg | 9.17 | 7.10 | **65.8** |
+| dribble_success | 0.0015 | 0.0015 | 0.0034 |
+| upright | 0.986 | 0.989 | 0.998 |
+
+**诚实结论:纯视觉自定位失败。**
+1. **决定性测试(−GT_pose)失败**:清零 GT pose obs 后误差 4.62→5.43m、朝向 9°→66°。虽没像
+   Phase A 爆到 85°,但明显恶化 → **RGB CNN 没接管定位**,估计仍主要依赖残留 GT 通路。
+2. **反常信号——这次估计本身就没训好**:baseline 4.62m 比上轮纯 explicit(无 RGB)的 1.51m **更差**;
+   `−estimate`(清零估计回传)误差反而更低(2.19m)。说明双 CNN + GT 渐隐双重压力下估计退化了。
+3. **训练轨迹铁证**:误差在 GT 渐隐期(iter400-1200)**单调恶化**(6.8→8.4m)并在 GT 全 0 后横住
+   不恢复。fresh RGB CNN 在 800 iter 内**没学会从球场线推位置**。
+4. dribble 也基本崩(success ~0.001-0.003)——任务太难 + 估计退化 + RGB 没接上,三重夹击。
+
+**根因分析(待验证的几个假说,按可能性排序):**
+- **(A) fresh RGB CNN 从零学视觉定位,800 iter 远不够**。深度 CNN 当初是在 v3f 长期训练里学的;
+  这里 RGB CNN 从随机初始化开始,还要同时和 GT 渐隐赛跑。**最可能的主因**。
+- **(B) GT 渐隐太早/太快**(iter400 就开始,从一个估计还没训好的状态)。应先让估计在 GT 全在时
+  充分收敛(到 ~1.5m)再开始渐隐。本轮 mlp.0 reinit 让估计 iter400 时还在 6.8m,根基不稳就抽拐杖。
+- **(C) RGB 看不清球场线**:相机 64×48 低分辨率 + FOV 60° + 球场线可能太细/对比低,CNN 无信号可学。
+  **需诊断**:渲染一帧 RGB 看球场线是否可见(类似 S1 当初验证深度看不见线那样)。
+- **(D) spatial-softmax 不适合定位**:它提取的是"亮点空间坐标",适合找球这种局部目标,未必适合
+  "从全局线条布局推位姿"。
+
+**下一步(需决策,未动手):**
+- 先做**便宜的诊断 (C)**:渲染机器人 RGB 视角一帧,确认球场线在 64×48 下是否可见、可学。若看不见,
+  上面 A/B 都白搭,得先解决可见性(提分辨率/加粗线/调相机)。
+- 若可见,再考虑 **(A)+(B)**:RGB CNN 预热(GT 全在时先训久点让估计收敛 + RGB 旁路学起来),再开始
+  更慢的 GT 渐隐(如 iter800→2000),给视觉定位足够学习时间。可能需要 >2000 iter。
+
+### 诊断 (C):RGB 可见性探针 (probe_rgb_field.py, 2026-06-06 晚) — 标线可见但信号弱且有歧义
+
+5 个已知位姿 × 3 分辨率,渲染 head cam RGB,统计"球场标线像素占比":
+
+| 位姿 | 64×48 | 128×96 | 说明 |
+|------|------|------|------|
+| midfield_face_x | 2.44% OK | 2.47% | 面朝 +x,中线/中圈在视野 |
+| **own_half_face_goal** | **0.39% LOW** | **0.46% LOW** | 远端球门只剩地平线几个像素 |
+| **corner_face_center** | **0.39% LOW** | **0.33% LOW** | 角球位,标线在侧后方看不到 |
+| near_opp_goal | 2.41% OK | 5.96% | 近球门,门柱+禁区线清晰 |
+| **center_circle_edge** | **0.42% LOW** | **0.48% LOW** | 中圈左右对称,有歧义 |
+
+**渲染图实证(看 soccer_eval/2026-06-06_spikes/v3g_rgb_probe/):**
+- `near_opp_goal`(OK):面朝近球门时门框/禁区线清晰可辨,定位信号充足。
+- `own_half_face_goal`(LOW):中圈白弧虽可见但又远又小,远端球门只是地平线一个极小黑点(~17m,几像素);
+  且**中圈左右对称**,单帧前视图无法唯一确定位姿。
+
+**诊断结论:Phase B+C 失败是三因叠加,(C) 可见性/地标弱是地基问题。**
+1. **不是纯像素问题**:提分辨率到 128×96 救不了那 3 个低位姿(仍 <0.5%)。根因是**视角+距离**——
+   头部相机前向平视,关键地标(球门、可区分线条)经常在十几米外只剩几像素。
+2. **信号有歧义**:中圈/边线左右对称,单帧前视无法唯一定位。人靠转头扫视+时序积分,单帧 CNN 没这能力。
+3. 地基不稳 → 延长训练 (A)/放慢课程 (B) 都救不了近一半看不见地标的位姿。
+
+**下一步方向(需用户决策,各有取舍,均未动手):**
+- **方向 1:加时序记忆(最对症)**。单帧→无歧义定位本就难。给 actor 加 RNN/GRU 或叠帧(frame stack),
+  让策略积分多帧视角推位姿。改动大(网络结构+rollout),但直击歧义根因。
+- **方向 2:降低定位难度的几何**。缩小场地/收窄初始位姿到地标密集区(近球门半场),让"看得见地标"成为
+  常态再谈视觉定位。代价:削弱泛化,且和"全场自定位"目标缩水。
+- **方向 3:RGB 预热 + 慢渐隐(最省事,但可能仍受限于歧义)**。GT 全在时先训 ~800 iter 让估计+RGB 旁路
+  收敛,再 iter800→2500 慢渐隐,加大 RGB CNN 容量。赌的是"有信号的位姿足够支撑学习"。
+- **方向 4:换/加相机**。加一个朝下广角或更高视点相机看更多地面标线。改 cfg 即可,但偏离真机头部相机设定。
+
+### v3g temporal: 给 RGB 加时序记忆(叠帧)— 实现就绪,全量训练中 (2026-06-06 晚)
+
+> 用户决策:加时序记忆破单帧歧义,选**叠帧优先**(frame-stack,非 RNN——低风险先验证)。
+> 叠帧让 CNN 看到多帧间**运动视差**:机器人移动/转头时对称地标位移模式不同,可消歧。
+
+**实现(全部本会话,smoke 实跑验证):**
+- **有状态叠帧 obs term** `StackedCameraRGB`(velocity/mdp/observations.py):`ManagerTermBase` 子类,
+  持 per-env `CircularBuffer`,把最近 N=4 帧 RGB 叠成 (B, N*3, H, W)=(B,12,48,64)。**append 时机坑已解**:
+  `compute_group` 每步被调多次,但靠 `env.common_step_counter` 去重,仅步计数前进时 append 一次;
+  obs manager 在 reset 时调 `func.reset(env_ids)` 清零该 env 历史(下次 append 自动 backfill)。
+- **env cfg** `mos92_soccer_selfloc_vision_env_cfg`:RGB obs term 换成 StackedCameraRGB 实例。
+  **吸取上轮教训放慢 GT 渐隐**:iter[400,1200]→**[800,2500]**,先让估计在 GT 全在时收敛再抽拐杖。
+- **CNN 自动适配**:RGB CNN input_channels 从 obs tensor 自动读=12(N*3),无需改 rl_cfg。
+- **partial-load**:从 rebalanced model_1999 bootstrap,actor 仅 mlp.0 reinit(153→217),RGB CNN fresh
+  (现 12 通道输入),critic 纯 MLP 不变(loaded 12 reinit 0)。smoke 实测确认。
+- **MAX_ITER 2800**(> GT 渐隐终点 2500,留时间在全 mask 下训练)。
+
+**smoke 验证(8 iter,exit 0):** camera_rgb dim=(12,48,64) ✓、RGB CNN 建为 12 通道 SpatialSoftmaxCNN ✓、
+叠帧 shape 正确、append cadence 对(每步一次)、无 NaN、partial-load 正确。`make check` 我的文件全清。
+
+**全量训练中**(2800 iter,~95min,比单帧久因多帧 RGB CNN forward)。决定性验证待训练后:用
+`probe_v3g_selfloc_vision.py`(叠帧对它透明),看 **−GT_pose 消融误差是否不再暴涨**(上轮单帧
+baseline 4.6m→−GT 5.4m;若叠帧让 RGB CNN 学会消歧,−GT 应接近 baseline)。诚实预期:叠帧加运动
+视差不加远景分辨率,若仍失败则上 RNN。**脚本:** `spike_v3g_selfloc_temporal.py`。
+
+
 

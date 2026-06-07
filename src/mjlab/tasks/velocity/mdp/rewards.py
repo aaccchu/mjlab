@@ -11,7 +11,7 @@ from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import BuiltinSensor, ContactSensor
 from mjlab.sensor.terrain_height_sensor import TerrainHeightSensor
 from mjlab.tasks.velocity.mdp.dribble_command import DribbleCommand
-from mjlab.tasks.velocity.mdp.observations import _gaze_uv_visible
+from mjlab.tasks.velocity.mdp.observations import _gaze_uv_visible, robot_field_pose
 from mjlab.tasks.velocity.mdp.terrain_utils import terrain_normal_from_sensors
 from mjlab.utils.lab_api.math import quat_apply, quat_apply_inverse
 from mjlab.utils.lab_api.string import (
@@ -741,3 +741,163 @@ def flight_phase(
   in_flight = airborne.all(dim=1).float()  # [B] 1.0 when ALL feet off.
   env.extras["log"]["Metrics/flight_phase_frac"] = in_flight.mean()
   return in_flight
+
+
+def illegal_body_contact(
+  env: ManagerBasedRlEnv,
+  sensor_name: str,
+) -> torch.Tensor:
+  """Penalize a non-foot body part touching the ball (规则1, 非法身体接触).
+
+  `illegal = body_contact and not foot_contact`. The body_ball sensor already
+  excludes feet/ankles, so any contact it reports IS illegal — thigh/knee/torso/
+  arm/hand pushing the ball. Returns per-env 0/1. Use with a negative weight.
+  """
+  sensor: ContactSensor = env.scene[sensor_name]
+  assert sensor.data.found is not None
+  illegal = (sensor.data.found.sum(dim=-1) > 0).float()
+  env.extras["log"]["Metrics/illegal_contact_frac"] = illegal.mean()
+  return illegal
+
+
+def ball_trapped(
+  env: ManagerBasedRlEnv,
+  foot_sensor: str,
+  body_sensor: str,
+  command_name: str,
+  speed_threshold: float = 0.05,
+) -> torch.Tensor:
+  """Penalize trapping/pinning the ball (规则3, 夹球 — the WORST violation).
+
+  `trapped = foot_contact AND body_contact AND ball_speed ~= 0`: the ball is
+  simultaneously held by a foot and a body part while not moving — i.e. pinned
+  between legs / under the torso (the v3d straddling exploit). This is the
+  reward-hacking attractor, so it carries the heaviest weight (-3.0).
+  """
+  foot: ContactSensor = env.scene[foot_sensor]
+  body: ContactSensor = env.scene[body_sensor]
+  cmd = env.command_manager.get_term(command_name)
+  assert foot.data.found is not None and body.data.found is not None
+  both_contact = (foot.data.found.sum(-1) > 0) & (body.data.found.sum(-1) > 0)
+  ball_stuck = cmd.metrics["ball_speed"] < speed_threshold
+  trapped = (both_contact & ball_stuck).float()
+  env.extras["log"]["Metrics/ball_trapped_frac"] = trapped.mean()
+  return trapped
+
+
+def holding_ball(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  time_threshold: float = 1.5,
+) -> torch.Tensor:
+  """Penalize holding the ball too long (规则2, 持球过久).
+
+  `holding = ball near (<0.4m) AND slow (<0.2 m/s) sustained > time_threshold`.
+  The holding_time accumulator (DribbleCommand) resets the moment the ball is
+  released or speeds up, so this fires only on sustained possession — "抱着球走".
+  Soccer is dynamic control, not occupation. Returns per-env 0/1.
+  """
+  cmd = env.command_manager.get_term(command_name)
+  holding = (cmd.metrics["holding_time"] > time_threshold).float()
+  env.extras["log"]["Metrics/holding_ball_frac"] = holding.mean()
+  return holding
+
+
+def ball_sticking(
+  env: ManagerBasedRlEnv,
+  foot_sensor: str,
+  command_name: str,
+  time_threshold: float = 1.0,
+) -> torch.Tensor:
+  """Penalize sticking to the ball without moving it (规则4, 粘球).
+
+  `sticking = foot contact AND ball ~stationary sustained > time_threshold`.
+  Distinct from holding: holding is about long POSSESSION (distance-based);
+  sticking is CONTACT-WITHOUT-PROGRESS (the ball touches the foot but is not
+  driven forward). Uses ball_stuck_time (speed-only accumulator). Per-env 0/1.
+  """
+  foot: ContactSensor = env.scene[foot_sensor]
+  cmd = env.command_manager.get_term(command_name)
+  assert foot.data.found is not None
+  has_contact = foot.data.found.sum(-1) > 0
+  stuck_long = cmd.metrics["ball_stuck_time"] > time_threshold
+  sticking = (has_contact & stuck_long).float()
+  env.extras["log"]["Metrics/ball_sticking_frac"] = sticking.mean()
+  return sticking
+
+
+def _selfloc_estimate(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
+  """The policy's raw self-localization estimate, shape (B, 4)."""
+  return env.action_manager.get_term(action_name).raw_action
+
+
+def selfloc_accuracy(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  std: float,
+  action_name: str = "selfloc",
+  pos_weight: float = 1.0,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Reward the policy for estimating its own field pose accurately (v3g).
+
+  The policy emits a 4-d cognitive output ``[x_n, y_n, sin(yaw), cos(yaw)]``
+  (see ``SelfLocAction``); this rewards it for matching the ground-truth
+  ``robot_field_pose``. Splits position vs heading error so the (normalized)
+  xy term and the sin/cos heading term stay comparable. Returns an exp kernel
+  in (0, 1] — high when the estimate is calibrated. Also logs the raw position
+  error in METERS for monitoring.
+  """
+  est = _selfloc_estimate(env, action_name)  # (B, 4)
+  gt = robot_field_pose(env, command_name, asset_cfg)  # (B, 4)
+  pos_err = torch.sum(torch.square(est[:, :2] - gt[:, :2]), dim=-1)
+  head_err = torch.sum(torch.square(est[:, 2:] - gt[:, 2:]), dim=-1)
+  err = pos_weight * pos_err + head_err
+
+  # Log calibration in meters: un-normalize x_n,y_n by the field half-extents.
+  cmd = _dribble_cmd(env, command_name)
+  dx_m = (est[:, 0] - gt[:, 0]) * cmd.cfg.half_length
+  dy_m = (est[:, 1] - gt[:, 1]) * cmd.cfg.half_width
+  pos_err_m = torch.sqrt(dx_m**2 + dy_m**2)
+  env.extras["log"]["Metrics/selfloc_pos_err_m"] = pos_err_m.mean()
+
+  return torch.exp(-err / std**2)
+
+
+def selfloc_error_penalty(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  action_name: str = "selfloc",
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Actively penalize a wrong self-localization estimate (v3g).
+
+  Returns the raw L2 distance between the estimate and ground-truth field pose
+  (register with a NEGATIVE weight). Complements ``selfloc_accuracy``: the exp
+  kernel saturates near zero for large errors, so a being-very-wrong estimate
+  is barely distinguished — this linear term keeps punishing gross errors and
+  matches the user's explicit "估错给罚" requirement. Per-env, positive.
+  """
+  est = _selfloc_estimate(env, action_name)
+  gt = robot_field_pose(env, command_name, asset_cfg)
+  err = torch.sqrt(torch.sum(torch.square(est - gt), dim=-1))
+  env.extras["log"]["Metrics/selfloc_err_l2"] = err.mean()
+  return err
+
+
+def time_to_goal_penalty(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+) -> torch.Tensor:
+  """Per-step cost while the goal is NOT yet scored (用户要求的"最少步骤").
+
+  Returns 1.0 for every env that has not yet scored this episode, 0.0 once the
+  ball has crossed into the goal (goal_scored latch). Register with a NEGATIVE
+  weight: the policy is pushed to score in as few steps as possible because the
+  accumulated penalty shrinks the sooner it scores. Stops penalizing after the
+  goal so it does not also punish post-score standing.
+  """
+  command = _dribble_cmd(env, command_name)
+  not_scored = 1.0 - command.goal_scored
+  env.extras["log"]["Metrics/not_scored_frac"] = not_scored.mean()
+  return not_scored

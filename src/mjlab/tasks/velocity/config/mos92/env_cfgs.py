@@ -4,7 +4,7 @@ from mjlab.asset_zoo.robots import MOS92_ACTION_SCALE, get_mos92_robot_cfg
 from mjlab.entity import EntityCfg
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp import dr
-from mjlab.envs.mdp.actions import JointPositionActionCfg
+from mjlab.envs.mdp.actions import JointPositionActionCfg, SelfLocActionCfg
 from mjlab.managers.curriculum_manager import CurriculumTermCfg
 from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.observation_manager import (
@@ -101,6 +101,21 @@ def mos92_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   joint_pos_action = cfg.actions["joint_pos"]
   assert isinstance(joint_pos_action, JointPositionActionCfg)
   joint_pos_action.scale = MOS92_ACTION_SCALE
+
+  # Cap shoulder_roll so the hands can never rise above shoulder height, while
+  # leaving shoulder_pitch (fore/aft swing) and elbow fully free for balance.
+  # Empirically calibrated (single-joint sweep, hand-vs-shoulder z + hand-thigh
+  # clearance): roll RAISES the arm (pitch only swings it fore/aft, ~0 z change).
+  #   right arm: roll default -0.15 == shoulder height; >-0.15 lifts above. Floor
+  #              -0.6 keeps the hand ~0.29 m off the thigh (no self-collision).
+  #   left arm:  mirror (default +0.15 == shoulder height; <+0.15 lifts above).
+  # clip applies to the absolute joint-position target (radians), since
+  # use_default_offset=True. Pitch/elbow are intentionally left unclipped so the
+  # policy retains arm motion for dynamic balance (the user's explicit ask).
+  joint_pos_action.clip = {
+    "right_shoulder_roll": (-0.6, -0.15),
+    "left_shoulder_roll": (0.15, 0.6),
+  }
 
   cfg.viewer.body_name = "base_link"
 
@@ -222,6 +237,26 @@ def mos92_soccer_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg.scene.sensors = (cfg.scene.sensors or ()) + (foot_ball_cfg,)
   cfg.sim.nconmax = 100
   cfg.sim.contact_sensor_maxmatch = 128
+
+  # Anti-cheat: NON-foot body parts touching the ball = illegal contact (规则1).
+  # `illegal = body_contact AND NOT foot_contact`. mode="body" matches each body
+  # individually; exclude the feet AND ankles (ankle contact is essentially a low
+  # foot-kick, excluding avoids false-positives on legit kicks). Everything else —
+  # torso/thigh/knee/shin/arm/hand/shoulder/head — touching the ball is a foul.
+  body_ball_cfg = ContactSensorCfg(
+    name="body_ball_contact",
+    primary=ContactMatch(
+      mode="body",
+      pattern=r".*",
+      entity="robot",
+      exclude=("Rfoot", "Lfoot", "Rankle", "Lankle"),
+    ),
+    secondary=ContactMatch(mode="geom", pattern="ball_geom", entity="ball"),
+    fields=("found",),
+    reduce="netforce",
+    num_slots=1,
+  )
+  cfg.scene.sensors = cfg.scene.sensors + (body_ball_cfg,)
 
   # Ball domain randomization (Sim2Real). Startup mode = sampled once per env at
   # model construction, so each parallel env sees a different ball.
@@ -347,6 +382,40 @@ def mos92_soccer_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     func=mdp.dribble_kick_contact,
     weight=1.0,
     params={"sensor_name": "foot_ball_contact", "command_name": "dribble"},
+  )
+
+  # Anti-cheat rule penalties (规则1-4). Base weights here are the FULL strength;
+  # a penalty_weight curriculum scales them up from 0.2 over training so the
+  # policy first learns to kick before penalties bite (avoids "don't touch the
+  # ball = safest"). Trapping (-3.0) is heaviest — it is the v3d straddling
+  # exploit and the strongest reward-hacking attractor.
+  cfg.rewards["ball_trapped"] = RewardTermCfg(
+    func=mdp.ball_trapped,
+    weight=-3.0,
+    params={
+      "foot_sensor": "foot_ball_contact",
+      "body_sensor": "body_ball_contact",
+      "command_name": "dribble",
+    },
+  )
+  cfg.rewards["holding_ball"] = RewardTermCfg(
+    func=mdp.holding_ball,
+    weight=-2.0,
+    params={"command_name": "dribble", "time_threshold": 1.5},
+  )
+  cfg.rewards["dangerous_high_kick"] = RewardTermCfg(
+    func=mdp.illegal_body_contact,
+    weight=-1.0,
+    params={"sensor_name": "body_ball_contact"},
+  )
+  cfg.rewards["ball_sticking"] = RewardTermCfg(
+    func=mdp.ball_sticking,
+    weight=-1.0,
+    params={
+      "foot_sensor": "foot_ball_contact",
+      "command_name": "dribble",
+      "time_threshold": 1.0,
+    },
   )
 
   cfg.curriculum.pop("command_vel", None)
@@ -587,6 +656,278 @@ def mos92_soccer_vision_ablation_env_cfg(play: bool = False) -> ManagerBasedRlEn
         "end_step": _MASK_END_ITER * _MASK_NSPE,
       },
     )
+    # Anti-cheat penalty ramp (Spike-C). Hold penalties weak (0.2x) while the
+    # policy relearns to kick from the v3d bootstrap, then ramp to full strength
+    # over iters 100->700 so trapping/holding/illegal/sticking bite once kicking
+    # is established. base_weights MUST match the RewardTermCfg weights above.
+    _PENALTY_TERMS = {
+      "ball_trapped": -3.0,
+      "holding_ball": -2.0,
+      "dangerous_high_kick": -1.0,
+      "ball_sticking": -1.0,
+    }
+    cfg.curriculum["penalty_ramp"] = CurriculumTermCfg(
+      func=mdp.penalty_weight_curriculum,
+      params={
+        "term_names": list(_PENALTY_TERMS.keys()),
+        "base_weights": _PENALTY_TERMS,
+        "start_step": 100 * _MASK_NSPE,
+        "end_step": 700 * _MASK_NSPE,
+        "start_factor": 0.2,
+      },
+    )
 
   return cfg
 
+
+# v3g self-localization step <-> iteration mapping (num_steps_per_env=24).
+_SELFLOC_NSPE = 24
+_SELFLOC_MASK_START_ITER = 400
+_SELFLOC_MASK_END_ITER = 1200
+
+# v3g temporal (frame-stacked RGB) self-loc. N frames stacked for inter-frame
+# parallax; GT fade is SLOWER than the failed single-frame run ([800,2500] vs
+# [400,1200]) so the estimate converges with GT present before the crutch goes.
+_NUM_RGB_FRAMES = 4
+# exp8: RGB-CNN warmup. Start GT fade LATER (1200 vs 800) so the fresh RGB branch
+# converges before the crutch is pulled, and fade SLOWER (end 3500 vs 2500). The
+# 4 prior pure-vision failures showed the fresh dual-CNN branch is a noise source
+# that pollutes the estimate during fade; a longer warmup gives it time to settle.
+_SELFLOC_VIS_MASK_START_ITER = 1200
+_SELFLOC_VIS_MASK_END_ITER = 3500
+
+# v3g exp7: widen field lines so they are VISIBLE at the 64x48 training res. The
+# line-width GATE (probe_line_width_gate.py) proved the 0.125 m spec lines are
+# sub-pixel from >10 m (worst-pose marking <0.5%, 2/5 poses visible); at 1.0 m
+# all 5/5 poses clear the 2% bar. This is a SIM-ONLY localization aid (real-field
+# lines are a fixed 0.125 m spec -> sim-to-real gap), used to test whether a CNN
+# can learn pure-vision self-loc once the signal genuinely exists.
+_SELFLOC_LINE_WIDTH = 1.0
+
+
+def mos92_soccer_selfloc_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """v3g Phase A/C: replace the goal-direction spoon-feed with self-localization.
+
+  Builds on the vision-ablation env (pure-vision ball, all anti-cheat penalties).
+  SWAPS the actor's ``robot_to_target`` (which hands the policy the goal bearing
+  for free) for ``robot_field_pose`` GT [x/L, y/W, sin(yaw), cos(yaw)] — so the
+  policy must derive "which way is the goal" from knowing where it stands. This
+  changes the actor 1D obs width 84 -> 85, so bootstraps need a PARTIAL load
+  (reinit mlp.0 + normalizer; keep depth-ball CNN + deeper MLP).
+
+  Phase A (this fn, no extra curriculum): robot_field_pose stays GT — prove the
+  "know where I am -> face goal -> kick" closed loop works before adding vision.
+  Phase C (spike script adds a mask curriculum on robot_field_pose): force the
+  RGB CNN to recover field pose. Critic keeps full GT (asymmetric) throughout.
+  """
+  cfg = mos92_soccer_vision_ablation_env_cfg(play=play)
+
+  # --- Geometry fix (root cause of the prior Phase-A failure) -----------------
+  # The selfloc chain never set goal_target_fraction (default 0.0), so the dribble
+  # target was a RANDOM point 2-6m from the ball. Knowing your field pose tells you
+  # nothing about a random point's bearing — only a FIXED landmark (the goal at
+  # x=+half_length) makes self-localization useful. Pin the target to the goal mouth
+  # so the goal bearing genuinely depends on the robot's field pose. Wide initial-pose
+  # randomization is inherited (base reset_base yaw +-pi, full-field xy) — DO NOT
+  # narrow it; self-loc is only meaningful when the spawn pose varies.
+  dribble = cfg.commands["dribble"]
+  assert isinstance(dribble, DribbleCommandCfg)
+  dribble.goal_target_fraction = 1.0
+  dribble.goal_line_x = dribble.half_length
+  dribble.goal_half_width = 1.0
+  dribble.target_dist_range = (1.0, 3.0)  # keep the goal reachable from spawn.
+
+  # Swap the actor's goal-direction leak for GT self-localization.
+  cfg.observations["actor"].terms["ball_to_target"] = ObservationTermCfg(
+    func=mdp.robot_field_pose,
+    params={"command_name": "dribble", "asset_cfg": SceneEntityCfg("robot")},
+  )
+
+  # --- Explicit self-localization: cognitive output + accuracy reward/penalty -
+  # Add a 4-d non-motor action term: the policy REPORTS its estimate of its own
+  # field pose [x_n, y_n, sin(yaw), cos(yaw)]. The value never drives the sim; it
+  # is scored against GT (selfloc_accuracy / selfloc_error_penalty) and fed back to
+  # the next obs via the existing "actions" (last_action) term, which auto-widens
+  # 20 -> 24. The motor "joint_pos" term stays first so its slice is unchanged.
+  cfg.actions["selfloc"] = SelfLocActionCfg(entity_name="robot", dim=4)
+
+  # Weights kept LOW so self-loc is an auxiliary shaping signal, not a rival to
+  # the dribble task. The first full run used accuracy=1.5 + upright≈0.87, which
+  # the policy could bank by just standing still and reporting its pose
+  # accurately (~2 reward) instead of dribbling to the far fixed goal (hard +
+  # sparse) — a textbook reward imbalance that killed dribbling. Dropping to 0.3
+  # makes "stand and localize" worth far less than the ~10 dribble potential.
+  cfg.rewards["selfloc_accuracy"] = RewardTermCfg(
+    func=mdp.selfloc_accuracy,
+    weight=0.3,
+    params={"command_name": "dribble", "std": 0.5, "action_name": "selfloc"},
+  )
+  cfg.rewards["selfloc_error_penalty"] = RewardTermCfg(
+    func=mdp.selfloc_error_penalty,
+    weight=-0.3,
+    params={"command_name": "dribble", "action_name": "selfloc"},
+  )
+  return cfg
+
+
+def mos92_soccer_selfloc_vision_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """v3g temporal: distill self-localization into an RGB CNN with frame-stacking.
+
+  Builds on the explicit-selfloc env (4-d cognitive estimate head + accuracy
+  reward). VISION WIRING: enable RGB on the head camera and add a "camera_rgb"
+  image obs group fed to a SECOND CNN branch (the depth-ball CNN is untouched —
+  depth stays for the ball, RGB carries self-loc from the painted field lines/
+  goal).
+
+  TEMPORAL MEMORY: the RGB obs is an N-frame STACK (StackedCameraRGB ->
+  (B, N*3, H, W)). A single front view is ambiguous (center-circle / side lines
+  are left/right symmetric, the goal is a few distant pixels); stacking frames
+  gives the CNN inter-frame parallax to disambiguate as the robot moves/turns.
+  This is the fix after the single-frame Phase B+C run failed (estimate could
+  not localize from one frame; error grew as GT faded).
+
+  DISTILLATION: a curriculum ramps the GT robot_field_pose obs (held under the
+  "ball_to_target" key) from scale 1 -> 0. The selfloc_accuracy reward compares
+  the estimate against robot_field_pose computed FRESH from true state each step
+  (independent of the obs term), so the teacher survives the obs mask. As GT
+  fades, the policy must read the RGB CNN to stay accurate. The fade is SLOWER
+  than the failed single-frame run (iters [800, 2500] vs [400, 1200]) so the
+  estimate converges with GT present before the crutch is removed. Critic keeps
+  full GT (asymmetric).
+  """
+  cfg = mos92_soccer_selfloc_env_cfg(play=play)
+
+  # Exp7 visibility fix: rebuild the field with WIDENED lines so the painted
+  # markings are resolvable at the 64x48 training resolution (GATE-verified: at
+  # 1.0 m all 5/5 probe poses clear the 2% marking-pixel bar; the 0.125 m spec
+  # lines are sub-pixel from >10 m). Both training and the probe build from this
+  # cfg, so they stay consistent. Sim-only aid (sim-to-real caveat noted above).
+  _wide_field = SoccerFieldCfg(line_width=_SELFLOC_LINE_WIDTH)
+  cfg.scene.spec_fn = lambda spec: build_soccer_field(spec, _wide_field)
+
+  # Vision wiring: enable RGB on the head camera + add the stacked-RGB obs group.
+  for sensor in cfg.scene.sensors or ():
+    if isinstance(sensor, CameraSensorCfg) and sensor.name == "head_cam":
+      sensor.data_types = ("depth", "rgb")
+  cfg.observations["camera_rgb"] = ObservationGroupCfg(
+    terms={
+      "head_cam_rgb": ObservationTermCfg(
+        # Stateful term instance (holds a per-env frame ring buffer). The obs
+        # manager calls .reset(env_ids) on episode reset and detects it via
+        # hasattr(func, "reset").
+        func=mdp.StackedCameraRGB(
+          None,  # type: ignore[arg-type]  # env injected lazily on first call
+          sensor_name="head_cam",
+          num_frames=_NUM_RGB_FRAMES,
+        ),
+        params={"sensor_name": "head_cam", "num_frames": _NUM_RGB_FRAMES},
+      )
+    },
+    enable_corruption=False,
+    concatenate_terms=True,
+    concatenate_dim=0,
+  )
+
+  # Distillation: fade the GT self-pose obs to 0 so the RGB CNN must carry
+  # self-loc. The reward's GT teacher (fresh robot_field_pose) is unaffected.
+  if not play:
+    cfg.curriculum["selfloc_gt_mask"] = CurriculumTermCfg(
+      func=mdp.mask_obs_scale,
+      params={
+        "group_name": "actor",
+        "term_names": ["ball_to_target"],  # holds GT robot_field_pose (4-d).
+        "start_step": _SELFLOC_VIS_MASK_START_ITER * _SELFLOC_NSPE,
+        "end_step": _SELFLOC_VIS_MASK_END_ITER * _SELFLOC_NSPE,
+      },
+    )
+
+  # exp8: raise the self-loc accuracy weight 0.3 -> 0.8. The 4 prior pure-vision
+  # failures traced (via cross-run probe comparison) to the dual-CNN branch
+  # SCATTERING the self-loc head: same weight 0.3 gave 1.5 m without vision but
+  # 9-11 m once the fresh RGB CNN was added. exp1 proved the head reaches 0.57 m
+  # at weight 1.5 — so 0.3 was too weak to hold the mapping against the noisy
+  # fresh branch. 0.8 restores gradient pressure on the head without the 1.5
+  # imbalance that killed dribbling. Only on the vision env (explicit env stays 0.3).
+  cfg.rewards["selfloc_accuracy"].weight = 0.8
+
+  return cfg
+
+
+# Bootstrap-from-model_2800 ramp: GT pose obs starts ALREADY faded (≈0). The
+# selfloc-vision policy we bootstrap from learned pure-vision at mask≈0, so
+# re-introducing full-scale GT would be OOD (the exp8 lesson). start=0,end=1
+# steps holds scale at ≈0 from the first step — no crutch, in-distribution.
+_E2E_FADE_START_ITER = 0
+_E2E_FADE_END_ITER = 1
+
+
+def mos92_soccer_e2e_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """END-TO-END (目标①②③ in ONE policy): pure-vision self-localize + depth
+  find-ball + dribble the ball INTO the fixed goal, fewest steps.
+
+  Builds on the selfloc-vision env, which already integrates ① (selfloc head +
+  accuracy reward + GT-fade distillation), ② (depth + RGB dual-CNN, ball-finding
+  obs), and ③-dribble (full dribble reward stack). This adds the GOAL-SCORING
+  layer ported from the goal env, plus the stability/min-steps lessons:
+
+    - goal geometry: half the episodes aim the fixed +x goal; robot spawns in
+      the attacking half facing the goal (but WIDER than the goal env so the
+      policy still exercises self-localization across the field).
+    - goal_progress (w2) + goal_scored (w5, the exp11-balanced value, NOT 10).
+    - upright 1.0 -> 2.5: exp11 proved this breaks the "score-or-stay-upright"
+      trade-off (fell_over 0.33 -> 0.14 with goal_rate UP).
+    - time_to_goal_penalty (w-0.02): the "fewest steps" objective; small so it
+      shapes speed without the late-collapse a heavier weight caused (exp12/13).
+    - GT pose obs starts already faded (≈0): bootstrap is from model_2800 which
+      localizes from vision, so we keep it in-distribution rather than re-adding
+      the GT crutch.
+
+  Trained via scripts/spike_v3g_e2e.py, which bootstraps the selfloc-vision
+  policy (model_2800: depth-ball CNN + RGB selfloc CNN + trunk + selfloc head)
+  so ①②③ skills carry over and only the goal-aiming behavior is newly learned.
+  """
+  cfg = mos92_soccer_selfloc_vision_env_cfg(play=play)
+
+  dribble = cfg.commands["dribble"]
+  assert isinstance(dribble, DribbleCommandCfg)
+  dribble.goal_target_fraction = 0.5
+  dribble.goal_line_x = dribble.half_length
+  dribble.goal_half_width = 1.0
+  dribble.target_dist_range = (1.0, 3.0)
+
+  # Attacking-half spawn facing the goal, but WIDER than the goal env (x from
+  # -2 to +8.5, full yaw spread on the non-goal half) so the policy keeps
+  # self-localizing across the field, not just near-goal shooting.
+  cfg.events["reset_base"].params["pose_range"] = {
+    "x": (dribble.half_length - 13.0, dribble.half_length - 2.5),
+    "y": (-(dribble.half_width - 2.0), dribble.half_width - 2.0),
+    "z": (0.01, 0.05),
+    "yaw": (-1.2, 1.2),
+  }
+
+  cfg.rewards["goal_progress"] = RewardTermCfg(
+    func=mdp.goal_progress, weight=2.0, params={"command_name": "dribble"}
+  )
+  cfg.rewards["goal_scored"] = RewardTermCfg(
+    func=mdp.goal_scored_bonus, weight=5.0, params={"command_name": "dribble"}
+  )
+  cfg.rewards["time_to_goal_penalty"] = RewardTermCfg(
+    func=mdp.time_to_goal_penalty, weight=-0.02, params={"command_name": "dribble"}
+  )
+
+  # exp11 stability balance: keep the robot on its feet while scoring.
+  cfg.rewards["upright"].weight = 2.5
+
+  # Keep GT pose obs faded from the start (bootstrap is already pure-vision).
+  if not play:
+    cfg.curriculum["selfloc_gt_mask"] = CurriculumTermCfg(
+      func=mdp.mask_obs_scale,
+      params={
+        "group_name": "actor",
+        "term_names": ["ball_to_target"],
+        "start_step": _E2E_FADE_START_ITER * _SELFLOC_NSPE,
+        "end_step": _E2E_FADE_END_ITER * _SELFLOC_NSPE,
+      },
+    )
+
+  return cfg

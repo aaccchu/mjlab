@@ -57,6 +57,40 @@ def mask_obs_scale(
   return {"mask_factor": torch.tensor(factor)}
 
 
+def penalty_weight_curriculum(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor,
+  term_names: list[str],
+  base_weights: dict[str, float],
+  start_step: int,
+  end_step: int,
+  start_factor: float = 0.2,
+) -> dict[str, torch.Tensor]:
+  """Ramp anti-cheat penalty weights from ``start_factor`` to 1.0 over a window.
+
+  Spike-C finding: adding full-strength illegal/trapping/holding penalties from
+  step 0 makes "don't touch the ball" the safest policy and dribbling collapses.
+  So hold the penalties weak (factor=start_factor) while the policy relearns to
+  KICK, then ramp factor 0.2->1.0 between start/end so penalties bite only once
+  kicking is established. Each term's live ``RewardTermCfg.weight`` is set to
+  ``base_weight * factor`` — RewardManager reads weight each compute(), so the
+  mutation takes effect next step. ``step`` is ``env.common_step_counter``.
+  """
+  del env_ids  # Global schedule, not per-env.
+  step = env.common_step_counter
+  if step <= start_step:
+    factor = start_factor
+  elif step >= end_step:
+    factor = 1.0
+  else:
+    frac = (step - start_step) / float(end_step - start_step)
+    factor = start_factor + (1.0 - start_factor) * frac
+  for term_name in term_names:
+    term_cfg = env.reward_manager.get_term_cfg(term_name)
+    term_cfg.weight = base_weights[term_name] * factor
+  return {"penalty_factor": torch.tensor(factor)}
+
+
 def terrain_levels_vel(
   env: ManagerBasedRlEnv,
   env_ids: torch.Tensor,

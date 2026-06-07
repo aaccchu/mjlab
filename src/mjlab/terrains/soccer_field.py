@@ -91,9 +91,18 @@ def _ball_face_centers():
   phi = (1.0 + 5.0**0.5) / 2.0
   verts = np.array(
     [
-      (0, 1, phi), (0, 1, -phi), (0, -1, phi), (0, -1, -phi),
-      (1, phi, 0), (1, -phi, 0), (-1, phi, 0), (-1, -phi, 0),
-      (phi, 0, 1), (phi, 0, -1), (-phi, 0, 1), (-phi, 0, -1),
+      (0, 1, phi),
+      (0, 1, -phi),
+      (0, -1, phi),
+      (0, -1, -phi),
+      (1, phi, 0),
+      (1, -phi, 0),
+      (-1, phi, 0),
+      (-1, -phi, 0),
+      (phi, 0, 1),
+      (phi, 0, -1),
+      (-phi, 0, 1),
+      (-phi, 0, -1),
     ],
     dtype=np.float64,
   )

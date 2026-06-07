@@ -35,9 +35,7 @@ def _pad_state_dict(sd: dict, n_new: int) -> dict:
   """Zero-pad first-layer weight + obs normalizer for n_new appended obs dims."""
   w = sd["mlp.0.weight"]  # (hidden, in_dim)
   hidden, in_dim = w.shape
-  sd["mlp.0.weight"] = torch.cat(
-    [w, torch.zeros(hidden, n_new, dtype=w.dtype)], dim=1
-  )
+  sd["mlp.0.weight"] = torch.cat([w, torch.zeros(hidden, n_new, dtype=w.dtype)], dim=1)
   mean = sd["obs_normalizer._mean"]
   pad_mean = torch.zeros(1, n_new, dtype=mean.dtype)
   pad_unit = torch.ones(1, n_new, dtype=mean.dtype)
@@ -90,5 +88,3 @@ def main() -> None:
 
 if __name__ == "__main__":
   main()
-
-
