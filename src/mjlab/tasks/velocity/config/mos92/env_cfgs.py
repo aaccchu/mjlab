@@ -704,6 +704,28 @@ _SELFLOC_VIS_MASK_END_ITER = 3500
 # can learn pure-vision self-loc once the signal genuinely exists.
 _SELFLOC_LINE_WIDTH = 1.0
 
+# v3g real-spec active-scan temporal self-loc. The line-width / resolution /
+# camera-geometry gates all proved a SINGLE frame at the real 0.125m spec can't
+# see enough markings from every pose (worst-pose <1% even with narrow-FOV tilt).
+# The real-robot answer (RoboCup): actively scan (neck_yaw is policy-controlled)
+# and INTEGRATE landmarks seen across the sweep over time. So: real 0.125m lines,
+# a modest resolution bump, and a long temporal window — more frames at a stride
+# so the stack spans a ~1.5s head sweep instead of 4 consecutive 50Hz steps.
+_REALSPEC_LINE_WIDTH = 0.125  # honest real-field spec — no sim-to-real gap.
+_REALSPEC_RGB_FRAMES = 6
+_REALSPEC_RGB_STRIDE = 6  # 6 frames x 6 steps = 36 control steps (~0.7s @ 50Hz).
+_REALSPEC_CAM_RES = (96, 72)  # modest bump from 64x48 (resolution alone proven
+# insufficient, but it helps once paired with the temporal scan).
+
+# v4 Exp1+: SEPARATED cameras. Root cause of 05 not kicking: depth (ball) and RGB
+# (self-loc) shared ONE head_cam, so bumping RGB resolution forced the depth image
+# resolution to change, which reinit-ed the depth-ball CNN's spatial_softmax
+# (H*W-dim) and ZEROED the inherited kicking skill (dribble_success 0.51 -> 0.00).
+# Fix: a SECOND camera for RGB only. depth stays 64x48 (kick CNN transfers, reinit
+# 0); the RGB cam gets its own (high) resolution for self-loc.
+_DUALCAM_DEPTH_RES = (64, 48)  # UNCHANGED — keeps the validated ball/kick CNN.
+_DUALCAM_RGB_RES = (96, 72)  # RGB-only self-loc cam; raised in later Exps (Exp2).
+
 
 def mos92_soccer_selfloc_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   """v3g Phase A/C: replace the goal-direction spoon-feed with self-localization.
@@ -853,6 +875,128 @@ def mos92_soccer_selfloc_vision_env_cfg(play: bool = False) -> ManagerBasedRlEnv
   return cfg
 
 
+def mos92_soccer_selfloc_realspec_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """REAL-SPEC pure-vision self-loc via ACTIVE SCANNING + temporal memory.
+
+  Drops the 1.0m sim-only widened lines back to the honest 0.125m field spec
+  (no sim-to-real line-width gap). The line-width / resolution / camera-geometry
+  gates all proved a SINGLE frame can't see enough 0.125m markings from every
+  pose. The real-robot fix (RoboCup): the neck is policy-controlled (neck_yaw +
+  neck_pitch are in the 20-motor action), so the policy can SCAN the field, and
+  a long temporal RGB window INTEGRATES the different landmarks the sweep brings
+  into view. Changes vs the widened-line vision env:
+    - field lines 1.0m -> 0.125m (real spec)
+    - RGB stack 4 frames -> 6 frames at stride 6 (spans ~0.7s of head sweep,
+      not 4 consecutive 50Hz steps)
+    - head cam 64x48 -> 96x72 (modest; resolution alone proven insufficient but
+      helps once paired with the scan)
+
+  Bootstrap from model_2800 (find-ball + dribble + partial single-frame self-loc
+  carry over); the RGB CNN's mlp.0 input grows (6*3 vs 4*3 channels) so that
+  layer reinit-s, the rest transfers. Active scanning emerges from the existing
+  selfloc_accuracy reward: scanning that lowers localization error is rewarded.
+  """
+  cfg = mos92_soccer_selfloc_vision_env_cfg(play=play)
+
+  # Honest real-field line width — removes the sim-to-real gap.
+  _real_field = SoccerFieldCfg(line_width=_REALSPEC_LINE_WIDTH)
+  cfg.scene.spec_fn = lambda spec: build_soccer_field(spec, _real_field)
+
+  # Bump head-cam resolution (depth + rgb) for finer markings.
+  for sensor in cfg.scene.sensors or ():
+    if isinstance(sensor, CameraSensorCfg) and sensor.name == "head_cam":
+      sensor.width = _REALSPEC_CAM_RES[0]
+      sensor.height = _REALSPEC_CAM_RES[1]
+
+  # Rebuild the stacked-RGB obs with MORE frames at a STRIDE (temporal window).
+  cfg.observations["camera_rgb"] = ObservationGroupCfg(
+    terms={
+      "head_cam_rgb": ObservationTermCfg(
+        func=mdp.StackedCameraRGB(
+          None,  # type: ignore[arg-type]  # env injected lazily on first call
+          sensor_name="head_cam",
+          num_frames=_REALSPEC_RGB_FRAMES,
+          stride=_REALSPEC_RGB_STRIDE,
+        ),
+        params={
+          "sensor_name": "head_cam",
+          "num_frames": _REALSPEC_RGB_FRAMES,
+          "stride": _REALSPEC_RGB_STRIDE,
+        },
+      )
+    },
+    enable_corruption=False,
+    concatenate_terms=True,
+    concatenate_dim=0,
+  )
+
+  return cfg
+
+
+def mos92_soccer_selfloc_dualcam_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """v4 Exp1: SEPARATED depth + RGB cameras (fixes 05 not kicking).
+
+  05 stopped kicking because depth (ball) and RGB (self-loc) shared one head_cam:
+  bumping RGB resolution forced the depth image resolution to change, reinit-ing
+  the depth-ball CNN's spatial_softmax and zeroing the inherited kick skill
+  (dribble_success 0.51 -> 0.00). Fix: keep the original head_cam at 64x48 for
+  DEPTH ONLY (kick CNN transfers cleanly, reinit 0) and add a SECOND camera
+  `head_cam_rgb` at its own resolution for the stacked-RGB self-loc branch.
+
+  Starts from the real-spec self-loc env (0.125m lines + temporal scan) but undoes
+  its resolution bump on the depth cam. Bootstrap from model_2800: depth CNN +
+  MLP trunk + selfloc head transfer; only the RGB CNN reinit-s (fresh branch).
+  """
+  cfg = mos92_soccer_selfloc_realspec_env_cfg(play=play)
+
+  # Revert the depth cam to its validated 64x48 (realspec had bumped it to 96x72).
+  for sensor in cfg.scene.sensors or ():
+    if isinstance(sensor, CameraSensorCfg) and sensor.name == "head_cam":
+      sensor.width = _DUALCAM_DEPTH_RES[0]
+      sensor.height = _DUALCAM_DEPTH_RES[1]
+      sensor.data_types = ("depth",)  # depth ONLY now — RGB moves to its own cam.
+
+  # Add a SECOND camera, co-located on the head, for RGB self-loc at its own res.
+  head_cam_rgb = CameraSensorCfg(
+    name="head_cam_rgb",
+    parent_body="robot/head",
+    pos=_HEAD_CAM_POS,
+    quat=_HEAD_CAM_QUAT,
+    fovy=60.0,
+    width=_DUALCAM_RGB_RES[0],
+    height=_DUALCAM_RGB_RES[1],
+    data_types=("rgb",),
+    use_textures=True,
+    use_shadows=False,
+    enabled_geom_groups=(0, 1, 2),
+  )
+  cfg.scene.sensors = (cfg.scene.sensors or ()) + (head_cam_rgb,)
+
+  # Re-point the stacked-RGB obs at the NEW rgb-only camera.
+  cfg.observations["camera_rgb"] = ObservationGroupCfg(
+    terms={
+      "head_cam_rgb": ObservationTermCfg(
+        func=mdp.StackedCameraRGB(
+          None,  # type: ignore[arg-type]  # env injected lazily on first call
+          sensor_name="head_cam_rgb",
+          num_frames=_REALSPEC_RGB_FRAMES,
+          stride=_REALSPEC_RGB_STRIDE,
+        ),
+        params={
+          "sensor_name": "head_cam_rgb",
+          "num_frames": _REALSPEC_RGB_FRAMES,
+          "stride": _REALSPEC_RGB_STRIDE,
+        },
+      )
+    },
+    enable_corruption=False,
+    concatenate_terms=True,
+    concatenate_dim=0,
+  )
+
+  return cfg
+
+
 # Bootstrap-from-model_2800 ramp: GT pose obs starts ALREADY faded (≈0). The
 # selfloc-vision policy we bootstrap from learned pure-vision at mask≈0, so
 # re-introducing full-scale GT would be OOD (the exp8 lesson). start=0,end=1
@@ -930,4 +1074,192 @@ def mos92_soccer_e2e_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       },
     )
 
+  return cfg
+
+
+def mos92_soccer_e2e_dualcam_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """v4 EXP1B: 04_e2e SAME-PIPELINE + real 0.125m lines + SEPARATED cameras.
+
+  The supervisor's key correction: 05/dualcam were the `selfloc_realspec` chain,
+  NOT the same pipeline as the 04_e2e model the user benchmarks against (different
+  geometry, reward layer, curriculum, bootstrap). So this builds on the ACTUAL
+  e2e env (attacking-half spawn + goal-scoring rewards + e2e fade schedule) and
+  only changes what v4 needs:
+    - field lines 1.0m -> 0.125m (honest real spec)
+    - depth cam stays 64x48 depth-only (kick CNN transfers, reinit 0)
+    - add head_cam_rgb (96x72 rgb-only) for the stacked-RGB self-loc branch
+  Bootstrap target: 04_e2e_integrated/model_1499 (already does full end-to-end
+  kick+goal), so kicking is INHERITED, not relearned — we only test whether
+  real-spec lines + separated RGB hurt self-loc. Supervisor's highest-priority
+  EXP1B and the correct same-pipeline comparison to 04.
+  """
+  cfg = mos92_soccer_e2e_env_cfg(play=play)
+
+  # Honest real-field line width (the whole point of v4).
+  _real_field = SoccerFieldCfg(line_width=_REALSPEC_LINE_WIDTH)
+  cfg.scene.spec_fn = lambda spec: build_soccer_field(spec, _real_field)
+
+  # depth cam: keep validated 64x48 depth-only (kick CNN transfers cleanly).
+  for sensor in cfg.scene.sensors or ():
+    if isinstance(sensor, CameraSensorCfg) and sensor.name == "head_cam":
+      sensor.width = _DUALCAM_DEPTH_RES[0]
+      sensor.height = _DUALCAM_DEPTH_RES[1]
+      sensor.data_types = ("depth",)
+
+  # Add a SECOND, RGB-only camera for the self-loc branch at its own resolution.
+  head_cam_rgb = CameraSensorCfg(
+    name="head_cam_rgb",
+    parent_body="robot/head",
+    pos=_HEAD_CAM_POS,
+    quat=_HEAD_CAM_QUAT,
+    fovy=60.0,
+    width=_DUALCAM_RGB_RES[0],
+    height=_DUALCAM_RGB_RES[1],
+    data_types=("rgb",),
+    use_textures=True,
+    use_shadows=False,
+    enabled_geom_groups=(0, 1, 2),
+  )
+  cfg.scene.sensors = (cfg.scene.sensors or ()) + (head_cam_rgb,)
+
+  # Re-point the stacked-RGB obs at the new rgb-only cam, with the temporal stride.
+  cfg.observations["camera_rgb"] = ObservationGroupCfg(
+    terms={
+      "head_cam_rgb": ObservationTermCfg(
+        func=mdp.StackedCameraRGB(
+          None,  # type: ignore[arg-type]  # env injected lazily on first call
+          sensor_name="head_cam_rgb",
+          num_frames=_REALSPEC_RGB_FRAMES,
+          stride=_REALSPEC_RGB_STRIDE,
+        ),
+        params={
+          "sensor_name": "head_cam_rgb",
+          "num_frames": _REALSPEC_RGB_FRAMES,
+          "stride": _REALSPEC_RGB_STRIDE,
+        },
+      )
+    },
+    enable_corruption=False,
+    concatenate_terms=True,
+    concatenate_dim=0,
+  )
+
+  return cfg
+
+
+def mos92_soccer_e2e_dualcam_geomcurric_env_cfg(
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """v4 EXP2: e2e_dualcam + SPAWN-GEOMETRY CURRICULUM (full-field -> attacking).
+
+  EXP1C decisively showed the self-loc bottleneck is geometric, not bootstrap /
+  warmup / resolution: same model_2800 + GT present gave 2.80m on full-field
+  geometry vs 7.07m on the attacking-half spawn. So this keeps everything from
+  e2e_dualcam (real 0.125m lines, separated cams, goal-scoring layer) but morphs
+  the spawn geometry over training: FULL-FIELD early (self-loc learns across
+  diverse poses, the easy regime) -> ATTACKING-half late (goal-scoring regime),
+  synced with the GT-fade warmup so localization is learned on easy geometry
+  BEFORE both the crutch is pulled and the geometry tightens.
+
+  Bootstrap target: model_2800 (in-distribution with GT warmup).
+  """
+  cfg = mos92_soccer_e2e_dualcam_env_cfg(play=play)
+
+  if not play:
+    full_field = {
+      "x": (-9.0, 9.0),
+      "y": (-5.0, 5.0),
+      "z": (0.01, 0.05),
+      "yaw": (-3.14159, 3.14159),
+    }
+    attacking = {
+      "x": (-2.0, 8.5),  # 11 - 13, 11 - 2.5; matches e2e_dualcam
+      "y": (-5.0, 5.0),
+      "z": (0.01, 0.05),
+      "yaw": (-1.2, 1.2),
+    }
+    cfg.events["reset_base"].params["pose_range"] = full_field
+    cfg.curriculum["spawn_geometry"] = CurriculumTermCfg(
+      func=mdp.spawn_geometry_curriculum,
+      params={
+        "event_name": "reset_base",
+        "start_step": 800 * _SELFLOC_NSPE,
+        "end_step": 2500 * _SELFLOC_NSPE,
+        "full_field_range": full_field,
+        "attacking_range": attacking,
+      },
+    )
+
+  return cfg
+
+
+def mos92_soccer_e2e_dualcam_keypoint_env_cfg(
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """v4 EXP5c: e2e_dualcam + KEYPOINT-DETECTION self-loc (depth+Kabsch geometry).
+
+  Paradigm shift after EXP1-5b proved regression-from-RGB collapses once the
+  GT-pose crutch fades (all runs: ~2m in warmup -> ~6.7m after GT off, across
+  16x resolution). Here the policy no longer regresses pose; it DETECTS K=23
+  field keypoints as pixel coords (selfloc action 4 -> 46). Supervision is the
+  per-frame projection of the known 3D field map (keypoint_detection_accuracy),
+  which is present every frame and never masked — no crutch to lose. Pose is
+  recovered geometrically (keypoint_pose_error: depth-lift -> base frame ->
+  Kabsch vs map), validated to ~1cm when detections are correct.
+
+  Bootstrap: model_2800. The RGB CNN + a fresh 46-d head learn keypoint pixels.
+  """
+  cfg = mos92_soccer_e2e_dualcam_env_cfg(play=play)
+
+  # K*2 = 46-d detection head (23 field keypoints, normalized pixel coords).
+  cfg.actions["selfloc"] = SelfLocActionCfg(entity_name="robot", dim=46)
+
+  # Drop the old pose-regression rewards; install keypoint detection + monitor.
+  for k in ("selfloc_accuracy", "selfloc_error_penalty"):
+    cfg.rewards.pop(k, None)
+  cfg.rewards["keypoint_detection"] = RewardTermCfg(
+    func=mdp.keypoint_detection_accuracy,
+    weight=2.5,  # EXP3 lesson: needs real gradient pressure in the e2e mix.
+    params={
+      "command_name": "dribble",
+      "std": 1.0,  # EXP5e: std=0.15 saturated the kernel (err~2 -> exp(-89)~0,
+      # zero gradient, keypoint_detection reward stuck at 0.0000). std=1.0 puts
+      # the gradient ramp across err in [0,1.5] so PPO can actually descend.
+      # Cheap falsification: if PPO STILL can't learn 46-d dense regression with
+      # a healthy gradient, that proves a supervised aux-loss is required (EXP5f).
+      "sensor_name": "head_cam",
+      "action_name": "selfloc",
+    },
+  )
+  cfg.rewards["keypoint_pose_error"] = RewardTermCfg(
+    func=mdp.keypoint_pose_error,
+    weight=1e-8,  # ~zero (term returns zeros) but NON-zero so the manager runs
+    # it: weight==0 terms are SKIPPED (reward_manager.py:122), which would
+    # suppress the kp_selfloc_pos_err_m geometry monitor.
+    params={
+      "command_name": "dribble",
+      "sensor_name": "head_cam",
+      "action_name": "selfloc",
+    },
+  )
+
+  # Geometry needs GT pose removed from obs entirely — keypoints don't use it.
+  # The old selfloc_gt_mask curriculum (if present) is now irrelevant; the
+  # detection label comes from projection, not a faded GT obs term.
+
+  # EXP5f A': training-only label group. project_keypoints -> (uv_x|uv_y|vis, K
+  # each). Enters rollout storage (so it aligns with each sampled transition) but
+  # is NOT added to the actor/critic obs_groups (see rl_cfg) — the policy never
+  # sees it; only KeypointAuxPPO's supervised aux loss consumes it.
+  cfg.observations["keypoint_label"] = ObservationGroupCfg(
+    terms={
+      "kp_uv": ObservationTermCfg(
+        func=mdp.keypoint_uv_label,
+        params={"sensor_name": "head_cam"},
+      )
+    },
+    enable_corruption=False,
+    concatenate_terms=True,
+    concatenate_dim=0,
+  )
   return cfg

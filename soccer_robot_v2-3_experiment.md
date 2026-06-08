@@ -1338,3 +1338,55 @@ baseline 4.6m→−GT 5.4m;若叠帧让 RGB CNN 学会消歧,−GT 应接近 bas
 
 
 
+
+
+
+
+---
+
+## 2026-06-07 端到端整合 + 真场线自定位(v3 soccer solo 攻关)
+
+### 背景
+12 小时自主推进交付三块独立能力后,用户要求(1)整合成"纯视觉定位→深度找球→带球进球"
+端到端单策略;(2)把自定位用的 1.0m 加粗标线改回 0.125m 真场规格,同时保住纯视觉定位。
+
+### 端到端整合(目标①②③ 单策略)
+- **关键发现**:`selfloc_vision` env 已含 ①自定位(selfloc head+accuracy reward+渐隐课程)+
+  ②找球(depth+RGB 双 CNN)+ ③带球(dribble reward 栈)。整合只需移植 goal env 的进球层。
+- **e2e env** `mos92_soccer_e2e_env_cfg`:进攻半场出生(比 goal env 更宽,保自定位多样性)+
+  goal_progress(w2)+goal_scored(w5,exp11平衡值)+time penalty(-0.02)+upright 提到 2.5。
+  从 model_2800 strict load(obs/action 同构,reinit 0),①②③ 技能全迁移。
+- **结果**:goal_rate 0.30、fell_over **0**(全程零摔倒)、dribble_success 0.51;但 selfloc
+  从 0.82→4.5m。**首判为 ①↔③ 容量竞争,提 selfloc 权重 0.8→1.6 重训完全无效(仍 4.5m)。**
+- **翻转性诊断(对照实验)**:整合前的 model_2800 放到**同样进攻半场几何**上自己也只有
+  4.65m(vs 整合后 4.5m,几乎相同)。**结论:整合干净成功,无容量竞争;selfloc"退化"几乎
+  全来自操作几何变难(进攻半场位姿多样性低、地标可见性差),不是整合破坏定位。** 教训:
+  比较必须控制几何分布,拿全场 0.82m 比进攻半场 4.5m 是错误归因。
+- 模型:`checkpoints/v3_soccer_solo/04_e2e_integrated/model_1499.pt`。
+
+### 真场线(0.125m)纯视觉自定位:gate 证伪单帧 + 主动扫视+时序方案
+- **三个相机 gate(0.125m 真场线,零训练便宜测试)**:
+  - 分辨率扫描(64×48→512×384):最差位姿标记占比 worst 0.32-0.39%,**像素提 64x 几乎不动**。
+  - 视场角(宽 60→90):同样 fail。
+  - 俯角×窄FOV组合(down10_25 最佳):worst 0.84%,仍 <2% 线。
+- **当时结论(过强,后有修正见下)**:0.125m 线低视角单帧物理看不全地标。用户选定方向:
+  **主动扫视+时序记忆**(neck_yaw 在策略动作里,真机 RoboCup 做法)。
+- **实现**:`StackedCameraRGB` 加帧间 **stride**(每 K 步存一帧,N 帧跨越 N×K 控制步的扫视窗);
+  `mos92_soccer_selfloc_realspec_env_cfg`:0.125m 真场线 + 6帧×stride6(~0.7s 扫视窗)+ 相机 96×72。
+  从 model_2800 shape-match bootstrap(RGB CNN mlp.0+spatial_softmax reinit 5 个,其余迁移)。
+- **结果**(`05_selfloc_realspec_0125m/model_3400.pt`):训练渐隐期一度到 2.0m,GT 全抽后稳定
+  4-6m;纯视觉(play=False, mask=0 硬置)**~5.8m**。时序积分**有显著帮助**(从单帧 >10m/看不见
+  拉到 5.8m),但**回不到加粗线的 0.79m**。num_envs 1024→384 解 CUDA OOM(图像 obs 涨 3.4x)。
+
+### 修正性发现(高分辨率机器人视角图)
+渲染 64×48→1280×960 七档机器人视角图(`robot_view_res/`)。**肉眼看 1280×960 的角落位姿:
+中圈/多条线/球门清晰可辨、完全可定位;而 64×48 同位姿一团糊、线消失。** 即:
+**之前"标记像素占比"gate 指标会误导**——高分辨率下线变清晰但占比不涨(草地像素同比例变多)。
+对 CNN 关键是线"可否分辨边缘"而非占比。**修正:64×48 下 0.125m 线确实亚像素消失,但高分辨率
+确实能找回线**,之前"物理上看不见"的结论下得太绝对。这支持用高分辨率重训真场线自定位。
+
+### 交付物
+- 模型:`checkpoints/v3_soccer_solo/{01..05}`(README 有逐模型说明+诚实保留)
+- 演示视频+可视化:`soccer_eval/2026-06-07_v3_soccer_solo/{01..05,robot_view_res}`
+- 脚本:`spike_v3g_e2e{,_fix}.py`、`spike_v3g_selfloc_realspec.py`、`probe_resolution_gate.py`、
+  `probe_camera_geom_realspec.py`、`render_v3_soccer_solo.py`、`render_robot_view_resolutions.py`

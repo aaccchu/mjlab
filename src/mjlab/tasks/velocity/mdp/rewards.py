@@ -901,3 +901,124 @@ def time_to_goal_penalty(
   not_scored = 1.0 - command.goal_scored
   env.extras["log"]["Metrics/not_scored_frac"] = not_scored.mean()
   return not_scored
+
+
+def _camera_pose_world(env: ManagerBasedRlEnv, sensor_name: str):
+  """(cam_pos (B,3), cam_mat (B,3,3)) for the named camera, from sim data."""
+  cam_idx = env.scene[sensor_name].camera_idx
+  sd = env.sim.data
+  cam_pos = sd.cam_xpos[:, cam_idx, :]
+  cam_mat = sd.cam_xmat[:, cam_idx, :].reshape(-1, 3, 3)
+  return cam_pos, cam_mat
+
+
+def keypoint_detection_accuracy(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  std: float,
+  sensor_name: str = "head_cam",
+  action_name: str = "selfloc",
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """v4 EXP5c: reward the policy for DETECTING field keypoints in the image.
+
+  Paradigm shift from selfloc_accuracy (which regressed pose and collapsed once
+  the GT-pose obs faded). Here the policy emits K*2 normalized pixel coords; we
+  supervise against the per-frame projection of the KNOWN 3D field keypoints
+  (project_keypoints), masked to visible points. This label is geometric and
+  present EVERY frame — there is no crutch to withdraw — so the learned image->
+  keypoint map can't decay the way the regression did. Pose itself is recovered
+  geometrically (see keypoint_pose_error), not learned.
+
+  Returns exp(-mean_visible_pixel_err / std^2) in (0,1]; only visible keypoints
+  contribute. Logs the raw mean pixel error for monitoring.
+  """
+  from mjlab.tasks.velocity.mdp.field_keypoints import (
+    field_keypoints_3d,
+    project_keypoints,
+  )
+
+  pred = _selfloc_estimate(env, action_name)  # (B, K*2) in [-1,1]
+  cam = env.scene[sensor_name]
+  W, H = cam.cfg.width, cam.cfg.height
+  fovy = cam.cfg.fovy if cam.cfg.fovy is not None else 45.0
+  cam_pos, cam_mat = _camera_pose_world(env, sensor_name)
+  origin = env.scene.env_origins
+  kp_local = field_keypoints_3d(env.device)
+  K = kp_local.shape[0]
+  kp_world = kp_local.unsqueeze(0) + origin.unsqueeze(1)
+  uv_gt, vis = project_keypoints(kp_world, cam_pos, cam_mat, fovy, W, H)  # (B,K,2),(B,K)
+  uv_pred = pred.view(-1, K, 2)
+  err = torch.linalg.norm(uv_pred - uv_gt, dim=-1)  # (B,K) normalized-pixel L2
+  w = vis.float()
+  denom = w.sum(dim=1).clamp(min=1.0)
+  mean_err = (err * w).sum(dim=1) / denom
+  env.extras["log"]["Metrics/kp_pixel_err"] = mean_err.mean()
+  env.extras["log"]["Metrics/kp_visible"] = w.sum(dim=1).mean()
+  # EXP5d: gate accuracy by visible fraction. Without this, the policy games the
+  # reward by turning away so NO keypoints are visible -> masked err -> 0 ->
+  # exp(0)=1 free reward (EXP5c: kp_visible collapsed 4->0.06, pos_err 11m while
+  # pixel_err stayed low). Multiplying by (visible/K) makes "see nothing" worth 0
+  # and applies a two-sided gradient: must SEE keypoints AND localize them well.
+  vis_frac = w.sum(dim=1) / float(uv_gt.shape[1])
+  return vis_frac * torch.exp(-mean_err / std**2)
+
+
+def keypoint_pose_error(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  sensor_name: str = "head_cam",
+  action_name: str = "selfloc",
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """v4 EXP5c: recover field pose from DETECTED keypoints via depth+Kabsch, log err.
+
+  Monitoring term (register with weight 0): runs the full geometric chain on the
+  policy's detected pixels — lift to camera-frame 3D via the RAW metric depth at
+  each detected pixel, transform to the robot BASE frame (kinematic, no world
+  pose), Kabsch-fit against the known map to recover (x, y). Logs the position
+  error in meters vs robot_field_pose GT, directly comparable to the <3m target.
+  Returns zeros (no reward) — the learnable signal is keypoint_detection_accuracy.
+  """
+  from mjlab.tasks.velocity.mdp.field_keypoints import (
+    field_keypoints_3d,
+    kabsch_se2,
+    lift_pixels_to_world,
+  )
+  from mjlab.utils.lab_api.math import matrix_from_quat
+
+  pred = _selfloc_estimate(env, action_name)  # (B, K*2)
+  cam = env.scene[sensor_name]
+  W, H = cam.cfg.width, cam.cfg.height
+  fovy = cam.cfg.fovy if cam.cfg.fovy is not None else 45.0
+  cam_pos, cam_mat = _camera_pose_world(env, sensor_name)
+  kp_local = field_keypoints_3d(env.device)
+  K = kp_local.shape[0]
+  uv_pred = pred.view(-1, K, 2)
+
+  # Sample RAW metric depth at each predicted pixel (nearest).
+  depth_raw = cam.data.depth  # (B, H, W, 1) meters
+  u_pix = ((uv_pred[..., 0] + 1.0) * 0.5 * (W - 1)).round().long().clamp(0, W - 1)
+  v_pix = ((uv_pred[..., 1] + 1.0) * 0.5 * (H - 1)).round().long().clamp(0, H - 1)
+  bidx = torch.arange(uv_pred.shape[0], device=env.device).unsqueeze(1).expand(-1, K)
+  depth_at = depth_raw[bidx, v_pix, u_pix, 0]  # (B, K)
+
+  pw = lift_pixels_to_world(uv_pred, depth_at, cam_pos, cam_mat, fovy, W, H)
+  robot = env.scene[asset_cfg.name]
+  base_pos = robot.data.root_link_pos_w
+  base_mat = matrix_from_quat(robot.data.root_link_quat_w)
+  rel = pw - base_pos.unsqueeze(1)
+  p_base = torch.einsum("bij,bkj->bki", base_mat.transpose(1, 2), rel)
+
+  valid = (depth_at > 0.05) & (depth_at < 30.0)
+  yaw_r, t_r = kabsch_se2(
+    p_base[..., :2], kp_local[..., :2].unsqueeze(0).expand(p_base.shape[0], -1, -1),
+    valid.float(),
+  )
+  origin = env.scene.env_origins
+  gt_xy = robot.data.root_link_pos_w[:, :2] - origin[:, :2]
+  pos_err_m = torch.linalg.norm(t_r - gt_xy, dim=-1)
+  env.extras["log"]["Metrics/kp_selfloc_pos_err_m"] = pos_err_m.mean()
+  return torch.zeros(p_base.shape[0], device=env.device)
+
+

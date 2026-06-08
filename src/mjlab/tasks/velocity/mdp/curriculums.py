@@ -57,6 +57,53 @@ def mask_obs_scale(
   return {"mask_factor": torch.tensor(factor)}
 
 
+def spawn_geometry_curriculum(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor,
+  event_name: str,
+  start_step: int,
+  end_step: int,
+  full_field_range: dict[str, tuple[float, float]],
+  attacking_range: dict[str, tuple[float, float]],
+  alpha_max: float = 1.0,
+) -> dict[str, torch.Tensor]:
+  """Linearly morph the reset spawn pose_range from FULL-FIELD to ATTACKING-half.
+
+  v4 EXP2/4: the e2e self-loc bottleneck has a geometric component — the
+  attacking-half spawn (near-goal, facing goal, low pose diversity) caps self-loc
+  at ~5m (v4 EXP3: full-field 2.13m vs attacking-half 5-8m even with high selfloc
+  weight). This curriculum self-localizes across the diverse full field early
+  (alpha=0), then concentrates toward the attacking half where goal-scoring is
+  learnable. ``alpha_max`` < 1.0 (EXP4) STOPS the morph short of the pure
+  attacking half, keeping a fraction of full-field spawn diversity so self-loc
+  doesn't collapse while the policy still gets enough near-goal episodes to score.
+
+  At step <= start_step: full_field_range. At step >= end_step: alpha_max blend.
+  In between: per-key linear interpolation of each (lo, hi) tuple. The reset event
+  reads pose_range from its params each reset, so mutating it here takes effect
+  on the next episode reset.
+  """
+  del env_ids  # Global, not per-env.
+  step = env.common_step_counter
+  if step <= start_step:
+    alpha = 0.0
+  elif step >= end_step:
+    alpha = alpha_max
+  else:
+    alpha = alpha_max * (step - start_step) / float(end_step - start_step)
+
+  blended: dict[str, tuple[float, float]] = {}
+  keys = set(full_field_range) | set(attacking_range)
+  for k in keys:
+    flo, fhi = full_field_range.get(k, (0.0, 0.0))
+    alo, ahi = attacking_range.get(k, (0.0, 0.0))
+    blended[k] = (flo + (alo - flo) * alpha, fhi + (ahi - fhi) * alpha)
+
+  term_cfg = env.event_manager.get_term_cfg(event_name)
+  term_cfg.params["pose_range"] = blended
+  return {"spawn_alpha": torch.tensor(alpha)}
+
+
 def penalty_weight_curriculum(
   env: ManagerBasedRlEnv,
   env_ids: torch.Tensor,

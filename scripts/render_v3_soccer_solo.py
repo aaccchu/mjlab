@@ -32,6 +32,7 @@ from mjlab.rl import MjlabOnPolicyRunner, RslRlVecEnvWrapper
 from mjlab.tasks.velocity.config.mos92.env_cfgs import (
   mos92_soccer_e2e_env_cfg,
   mos92_soccer_goal_env_cfg,
+  mos92_soccer_selfloc_realspec_env_cfg,
   mos92_soccer_selfloc_vision_env_cfg,
   mos92_soccer_vision_ablation_env_cfg,
 )
@@ -73,6 +74,12 @@ MODELS = {
     mos92_selfloc_vision_ppo_runner_cfg,
     CKPT_ROOT / "04_e2e_integrated" / "model_1499.pt",
     True,  # pure-vision selfloc + find-ball + dribble-to-goal in one policy
+  ),
+  "05_realspec": (
+    mos92_soccer_selfloc_realspec_env_cfg,
+    mos92_selfloc_vision_ppo_runner_cfg,
+    CKPT_ROOT / "05_selfloc_realspec_0125m" / "model_3400.pt",
+    True,  # 0.125m real lines + active scan + temporal memory, pure vision
   ),
 }
 

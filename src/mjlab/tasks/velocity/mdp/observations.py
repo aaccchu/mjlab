@@ -226,14 +226,31 @@ class StackedCameraRGB(ManagerTermBase):
   stacked buffer unchanged.
   """
 
-  def __init__(self, env: ManagerBasedRlEnv, sensor_name: str, num_frames: int):
+  def __init__(
+    self,
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    num_frames: int,
+    stride: int = 1,
+  ):
     super().__init__(env)
     if num_frames < 1:
       raise ValueError(f"num_frames must be >= 1, got {num_frames}")
+    if stride < 1:
+      raise ValueError(f"stride must be >= 1, got {stride}")
     self._sensor_name = sensor_name
     self._n = num_frames
+    # Append a frame only every `stride` env steps, so the N-frame stack spans
+    # N*stride control steps. At 1 stride the stack is the last N steps (~0.08s
+    # at 50Hz — too short to cover a head sweep); a larger stride lets the same
+    # N frames span a ~1-2s active scan, capturing the DIFFERENT landmarks the
+    # neck_yaw sweep brings into view. This is the temporal-memory lever for
+    # pure-vision self-loc at the real 0.125m line spec (single frame can't see
+    # enough markings from every pose; a scan integrated over time can).
+    self._stride = stride
     self._buf: CircularBuffer | None = None
     self._last_step: int = -1
+    self._steps_since_append: int = 0
 
   def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
     if self._buf is None:
@@ -242,17 +259,68 @@ class StackedCameraRGB(ManagerTermBase):
     self._buf.reset(batch_ids=batch_ids)
     # Force a re-append next call so reset rows get backfilled this step.
     self._last_step = -1
+    self._steps_since_append = 0
 
   def __call__(
-    self, env: ManagerBasedRlEnv, sensor_name: str, num_frames: int
+    self, env: ManagerBasedRlEnv, sensor_name: str, num_frames: int, stride: int = 1
   ) -> torch.Tensor:
     rgb = camera_rgb(env, sensor_name)  # (B, C, H, W), C=3
     if self._buf is None:
       self._buf = CircularBuffer(self._n, env.num_envs, env.device)
     step = int(env.common_step_counter)
     if step != self._last_step or not self._buf.is_initialized:
-      self._buf.append(rgb)
+      # New env step. Append only every `stride`-th step so the N-frame stack
+      # spans N*stride control steps (a head-sweep time window). Always append
+      # on the first call after a reset (buffer uninitialized) so the freshly
+      # reset rows get a real frame immediately.
+      if (
+        not self._buf.is_initialized
+        or self._steps_since_append >= self._stride - 1
+      ):
+        self._buf.append(rgb)
+        self._steps_since_append = 0
+      else:
+        self._steps_since_append += 1
       self._last_step = step
     buf = self._buf.buffer  # (B, N, C, H, W) chronological oldest->newest
     b, n, c, h, w = buf.shape
     return buf.reshape(b, n * c, h, w)
+
+
+def keypoint_uv_label(
+  env: ManagerBasedRlEnv,
+  sensor_name: str = "head_cam",
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """v4 EXP5f: TRAINING-ONLY supervision label for keypoint detection. (B, K*3).
+
+  Per-frame projection of the known 3D field keypoints into the camera image:
+  [uv_x(K), uv_y(K), vis(K)] flattened. Fed into a dedicated obs group
+  ``keypoint_label`` that enters the rollout storage (so it aligns with each
+  sampled transition) but is NOT listed in the actor/critic obs_groups — so the
+  policy never sees the label, only KeypointAuxPPO's supervised loss consumes it.
+  Labels are sim geometry (supervision, not a deployment input).
+  """
+  from mjlab.tasks.velocity.mdp.field_keypoints import (
+    field_keypoints_3d,
+    project_keypoints,
+  )
+
+  cam = env.scene[sensor_name]
+  W, H = cam.cfg.width, cam.cfg.height
+  fovy = cam.cfg.fovy if cam.cfg.fovy is not None else 45.0
+  cam_idx = cam.camera_idx
+  sd = env.sim.data
+  cam_pos = sd.cam_xpos[:, cam_idx, :]
+  cam_mat = sd.cam_xmat[:, cam_idx, :].reshape(-1, 3, 3)
+  origin = env.scene.env_origins
+  kp_local = field_keypoints_3d(env.device)
+  kp_world = kp_local.unsqueeze(0) + origin.unsqueeze(1)
+  uv, vis = project_keypoints(kp_world, cam_pos, cam_mat, fovy, W, H)  # (B,K,2),(B,K)
+  # Zero invisible keypoints' uv so off-frame/behind-cam projections (can be huge)
+  # never leak into the loss even if masking has an indexing slip. Layout:
+  # interleaved [u0,v0,u1,v1,...] then [vis0,...] so a (-1,K,2) reshape aligns.
+  vis_f = vis.float()
+  uv = uv * vis_f.unsqueeze(-1)
+  b, k = vis.shape
+  return torch.cat([uv.reshape(b, k * 2), vis_f], dim=-1)  # (B, K*3)

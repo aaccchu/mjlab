@@ -79,6 +79,9 @@ class RslRlPpoAlgorithmCfg:
   """Share CNN encoders between actor and critic."""
   class_name: str = "PPO"
   """Algorithm class name resolved by RSL-RL."""
+  keypoint_cfg: dict[str, Any] | None = None
+  """v4 EXP5f: config for KeypointAuxPPO's supervised keypoint aux loss
+  (action_start/end slice, label_group, coef, num_keypoints). None for plain PPO."""
 
 
 @dataclass

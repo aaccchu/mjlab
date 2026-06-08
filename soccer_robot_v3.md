@@ -1867,3 +1867,38 @@ v3 = 在 v2 的真实物理和进球闭环基础上,用三轴课程联动(规则
 球丢失记忆、learned gaze action head、gaze teacher-forcing 消除、critic 加噪、
 metric-driven curriculum。实现上尽量复用 mjlab 基础设施,但 camera/gaze action/
 delay buffer 都必须先 smoke test。
+
+
+
+
+---
+
+# v3 最终成果总结(2026-06-07 实跑收口)
+
+> 本节为 v3 的实跑落地结果。以 **04_e2e 为 v3 代表模型**(纯视觉定位+找球+带球进球单策略)。
+> 完整实验链见 `soccer_robot_v2-3_experiment.md`;改进方案见 `soccer_robot_v4.md`。
+
+## 交付的模型(checkpoints/v3_soccer_solo/)
+| 编号 | 模型 | 能力 | 关键指标 |
+|------|------|------|----------|
+| 01 | selfloc_purevision/model_2800 | 纯视觉自定位 | 0.79m(**1.0m 加粗线**,有 sim2real gap) |
+| 02 | findball_depth/model_1499 | 深度找球 | 纯视觉球向量 |
+| 03 | dribble_goal/model_1600 | 带球进球 | goal_rate 0.43 |
+| **04** | **e2e_integrated/model_1499** | **①②③ 端到端单策略(v3 代表)** | **goal_rate 0.30, fell_over 0, dribble_success 0.51** |
+| 05 | selfloc_realspec_0125m/model_3400 | 0.125m 真场线+主动扫视+时序 | selfloc 5.8m,**但不踢球(见根因)** |
+
+## v3 核心结论
+1. **端到端整合干净成功**:①②③ 可融进单策略,稳定性满分(fell_over 0)。所谓"自定位退化"
+   经对照实验证明是**操作几何变难**(进攻半场地标少)所致,非能力互相破坏。
+2. **0.125m 真场线纯视觉定位的物理边界(已修正)**:64×48 下线亚像素消失;但高分辨率视角图证明
+   **1280×960 下连角落位姿的线都清晰可辨**——之前"像素占比"gate 指标误导,真场线在足够分辨率下
+   可定位。这是 v4 的关键依据。
+3. **05 不踢球的根因(v4 必修)**:depth 和 RGB **共用 head_cam 传感器**,05 为自定位提分辨率
+   (64×48→96×72)连带改了 depth 图分辨率,导致 depth-ball CNN 的 spatial_softmax 被 reinit
+   (192→432),从 model_2800 继承的踢球能力归零。dribble_success 0.51→0.00。
+   **修复方向:分离两个相机**(depth 保 64×48 完整迁移踢球 CNN,RGB 单独高分辨率做自定位)。
+
+## v3 → v4 的交接
+v4 聚焦"在真场线(0.125m)下同时保住踢球 + 提升自定位精度",三条主线:
+(a) **分离相机 + RGB 高分辨率(到 1280×960 区间)**;(b) **距离自适应精度机制**(远粗近精);
+(c) **更高级自定位方法**(关键点+PnP / 粒子滤波 MCL)。详见 `soccer_robot_v4.md`。
