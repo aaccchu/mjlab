@@ -938,3 +938,27 @@ EXP15中止(threshold0.6掐死奖励致ball_speed反降、std1.0致fell_over翻�
 **判据**: ① 真实射门率能否升(脱离子集~0.2→目标0.5) ② ball_speed_peak能否升(学会真踢) ③
 护栏: fell_over回落<0.1(验证std0.85不失稳)、out_of_bounds<0.25(验证spawn修好)、pos_err<1.1。
 对照EXP14(全局goal0.11≈子集0.22, fell0.07, oob0.28)。日志/tmp/v4_exp16_full.log。
+
+## EXP16 结果判读(2026-06-09,B2踢球线目前最好的一轮)
+readout 末100采样:**真实射门率 0.319(子集)**=goal_rate 0.154/tgt_is_goal 0.483,较EXP14子集~0.22涨+45%(主目标大涨,已过目标0.5中段)。
+| 指标 | EXP16 | EXP14 | 判定 |
+|---|---|---|---|
+| 真实射门率(子集) | **0.319** | ~0.22 | ✅ +45% |
+| goal_rate(全局) | 0.154 | 0.11 | ✅ +40% |
+| episode_success | 0.479 | 0.42 | ✅ |
+| ball_to_tgt_err | 2.35m | 2.45 | ✅ |
+| ball_speed_peak | 2.96 | — | ✅ 有踢力 |
+| **fell_over** | **0.044** | 0.07 | ✅ 最稳(EXP15是0.126) |
+| out_of_bounds | 0.345 | 0.28 | ❌ 升高(根因已查清) |
+| pos_err | 0.91 | 0.97 | ✅ 护栏守住 |
+**结论**:EXP15两个过头改动(threshold0.6掐死信号、std1.0致fell翻倍)都修正了——**std0.85+threshold0.3是对的组合**,fell_over降到0.044证明。checkpoint=model_1999.pt(已存,作EXP17 bootstrap源)。
+**唯一遗留 out_of_bounds 0.345**:不是这轮失败,是学会射门的副产品(out_bnd vs goal_rate +0.514),根因=time_out语义错误(见下EXP17+v4评估指标详解.md §6+v4越界处理调研.md)。小信号robot_to_ball↑0.91、ball_stuck_s↑0.82同源(大力踢球后球飞远→去追→追出界/球停)。
+
+## EXP17 启动(2026-06-09→10,修out_of_bounds的time_out语义bug)
+**根因(代码+数据+文献三方钉死)**:out_of_field_bounds设time_out=True→PPO对truncation做bootstrap(`rewards+=γ·V(出界后)`,rsl_rl ppo.py:150)→等于"出界免罚"。对照:fell_over正确设time_out=False,唯独出界误标。完整因果链见v4评估指标详解.md §6。
+**改动(研究第1+2步一起上,防策略变保守)**:
+1. out_of_field_bounds → **time_out=False**(真终止,不bootstrap)+ 一次性out_of_bounds_penalty(weight−5,dt缩放后~0.10,小起步勿压垮探索)。
+2. **球门走廊**:|root_y|<1.3m(略宽于门宽1.0)时端线出界限放宽0.6m,让为射门合法冲门不被罚;侧线/无关底线不变。out_of_field_bounds新增goal_corridor_half_width/goal_buffer参数(默认0=原矩形,向后兼容)。
+**bootstrap**: EXP16 model_1999,**无std重置**(踢球技能已学会,只改边界激励;smoke确认actor25/critic12全load、reinit0)。
+**判据**: ① out_of_bounds降向≤0.20 ② 同时真实射门率守住~0.32 ③ 护栏fell_over<0.1、pos_err<1.1。
+**失败信号(研究红线)**: 若射门率塌或robot_to_ball升→惩罚过重/走廊过窄,回退weight。脚本scripts/spike_v4_e2e_ekf_kick_oob.py,日志/tmp/v4_exp17_full.log。
