@@ -89,3 +89,22 @@ DeepMind Learning Agile Soccer Skills(arXiv:2304.13653):
 - DeepMind 蒸馏:arxiv.org/abs/2304.13653 ;精读 summary.j3soon.com/posts/learning-agile-soccer-skills-for-a-bipedal-robot-with-deep-reinforcement-learning
 - 反应式 approach/align/kick:arxiv.org/abs/2511.03996 ;striker skills arxiv.org/abs/2512.06571
 - codex 诊断:mjlab_codex_v4/soccer_robot_v4_experiment.md EXP7C20a(根因)、C21a(上帝视角对照)
+
+---
+
+## 五、设计澄清(2026-06-09,检查自家 obs 代码后修正 B1/B2 优先级)
+检查 EXP13 实际 obs:`robot_to_ball`(observations.py:64)和 `ball_velocity_b`(:140)都直接读
+`command.ball_pos_w`/`ball_lin_vel_w` = **oracle 真值,不受相机可见性影响**。
+→ **关键推论**:当前 oracle 阶段,actor 拿到的球位/球速永远完美,即使球出视野。
+所以 codex C20a"球到脚边相机看不见"的问题,**在 oracle 阶段不影响 actor**(actor 不靠相机看球)。
+**这修正了线B 优先级**:
+- B1(短时 ball belief)是为**换真检测器后球会看不见**准备的——在 oracle 阶段不是瓶颈,应推迟到视觉阶段。
+- **当前 oracle 阶段真正缺的是 B2**:即使知道球在脚边的完美位置,策略也没学会"近脚踢击/盲推"动作。
+  这是更纯粹的动作技能缺失,与感知无关。codex C21a 上帝视角(完美球位)注入命令也只 0.018,
+  正因为冻结策略没有这个踢击动作技能。
+**修正后线B 路线**:
+- **B2 先做(oracle 阶段)**:近脚窗口 spawn 球专训踢球动作技能(impulse 奖励+可选踢腿参考)。
+  目标把 0.018→接近上界 0.68。输入用现成 oracle 球 obs 即可,不需 B1。
+- **B3**:teacher-distillation 合并接近专家+踢球专家。
+- **B1 推迟**:等踢球技能成熟、且进入真检测器视觉阶段后,再做 ball belief 解决"踢球时看不见球"。
+这是更省力的路径:oracle 阶段先纯粹解决"动作技能",把感知问题留到视觉阶段。
