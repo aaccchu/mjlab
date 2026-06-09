@@ -1,0 +1,50 @@
+{
+  "Metrics/selfloc_pos_err_m": {
+    "mean": 0.964382931470871,
+    "median": 0.9704501032829285,
+    "min": 0.8494321703910828,
+    "max": 1.0879966020584106,
+    "n": 250
+  },
+  "Episode_Termination/fell_over": {
+    "mean": 0.0,
+    "median": 0.0,
+    "min": 0.0,
+    "max": 0.0,
+    "n": 2
+  },
+  "goal_rate": {
+    "mean": 0.0014375,
+    "median": 0.0,
+    "min": 0.0,
+    "max": 0.015625,
+    "n": 250
+  },
+  "episode_success": {
+    "mean": 0.1145,
+    "median": 0.125,
+    "min": 0.03125,
+    "max": 0.1875,
+    "n": 250
+  },
+  "ball_to_target_error": {
+    "mean": 4.139944113731384,
+    "median": 4.121161460876465,
+    "min": 3.7243564128875732,
+    "max": 4.565525054931641,
+    "n": 250
+  },
+  "ball_speed": {
+    "mean": 0.32386162573099136,
+    "median": 0.32469889521598816,
+    "min": 0.21264797449111938,
+    "max": 0.45732444524765015,
+    "n": 250
+  },
+  "_meta": {
+    "ckpt": "checkpoints/v4_soccer/lineB_kick_exp14/model_1999.pt",
+    "num_envs": 64,
+    "steps": 400,
+    "warmup": 150
+  }
+}

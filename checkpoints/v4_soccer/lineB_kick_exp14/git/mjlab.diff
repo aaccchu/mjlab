@@ -1,0 +1,37 @@
+--- git commit ---
+c33742895eb7ce7f285dde16063c32b64bad7724
+
+
+--- git status ---
+On branch main
+Your branch is ahead of 'origin/main' by 11 commits.
+  (use "git push" to publish your local commits)
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   soccer_robot_v4_experiment.md
+
+no changes added to commit (use "git add" and/or "git commit -a") 
+
+
+--- git diff ---
+diff --git a/soccer_robot_v4_experiment.md b/soccer_robot_v4_experiment.md
+index 9bd51615..0c8ad7ca 100644
+--- a/soccer_robot_v4_experiment.md
++++ b/soccer_robot_v4_experiment.md
+@@ -859,3 +859,14 @@ bootstrap 全载无 mismatch,在线 EKF 正常运行。
+   印证核心判断:踢球动作技能(B2)是独立缺失件,定位只能把球带到离门3m,从3m到进门的踢击仍缺技能。
+ **线A 收官**:0.98m 达标。是否再加R2对称消歧榨到0.79m,优先级低于线B(goal_rate命门)。
+ **下一步**:转线B,先做B2(近脚窗口spawn球专训踢球动作技能)。EXP13 model 作为后续bootstrap基线。
++
++## EXP14 启动(2026-06-09,线B B2:近脚踢球技能)
++针对踢球链断裂(EXP13 goal_rate 0.08,根因=动作技能缺失非感知/奖励)。三处改动:
++1. near_foot_spawn_fraction=0.5:一半episode球spawn在脚前踢击窗口(0.08-0.20m)密集练踢,
++   一半保持完整任务防遗忘。解决spawn_dist≥0.6m致踢击样本稀疏。
++2. dribble_kick_impulse(w1.5):接触步奖励球速朝门投影(踢击质量)。
++3. ekf_kick env+spike从EXP13 model_1999 bootstrap(继承定位0.98m+步态+接近)。
++smoke通过:全载/奖励激活/无错。
++**判据**:① goal_rate能否从0.08显著上升(目标→0.2)、episode_success↑ ② 护栏:pos_err不退化(<1.1)、
++fell_over<0.1(踢球训练不能破坏线A定位与稳定) ③ ball_speed↑/ball_stuck↓。
++对照EXP13:goal 0.08,success 0.40,pos_err 0.98,fell_over 0.057。日志/tmp/v4_exp14_full.log。
