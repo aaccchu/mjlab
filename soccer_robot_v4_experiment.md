@@ -757,3 +757,59 @@ codex 还独立监督了我的 EXP8 训练,第三方判读与我一致:not_score
 scripts/probe_v4_contact_windows.py(近脚触球窗口诊断)。下次 eval 应借鉴其指标集,不只看 pos_err。
 **结论修正**:v4 真正的拦路虎是**踢球链(belief→近脚窗口→推球)**,自定位只是前置。我应在修完融合 bug、
 确认自定位能到 1m 后,把重心转向 codex 已诊断清楚的踢球链问题,而非继续在扫视上深挖。
+
+## EXP11 启动(2026-06-09,融合bug修复后重跑,隔离"健康融合"变量)
+目的=回答线A问题:**修好融合 bug 后,健康时序融合能把纯视觉 pos_err 推到多少?能否接近 0.79m?**
+脚本 `scripts/spike_v4_e2e_fused_fixed.py`,与 EXP8 完全相同配置(fused_scan env + EXP6 model_2999 bootstrap),
+**唯一变量=融合 append bug 已修**(commit 63a851ab)。这样 pos_err 改善可干净归因于健康融合。
+对照:EXP8(bug 未修)末100 pos_err 1.70m、uniq 0.25。
+**判据**:① pos_err 是否显著低于 1.70m、能否趋近离线验证的 1.03m 甚至 0.79m
+② uniq_frac 是否因缓冲正常滚动而升 ③ fell_over 保持低。
+若 pos_err 明显改善→证明此前"被动融合无效"的结论部分是 bug 假象,自定位线有救;
+若仍 1.7m→说明被动融合确实弱,自定位需靠主动扫视(回 EXP10 线但要解决稳定性)。
+日志 /tmp/v4_exp11_full.log。
+
+## GitHub/文献调研:RoboCup 自定位方法(2026-06-09,可能重塑线A)
+查阅 RoboCup SPL/Humanoid League 几十年经验 + 近年 arXiv。**核心洞察(改变方法判断)**:
+
+### 洞察1:不该用单帧/多帧 Kabsch,应用 EKF/UKF 递归滤波(最高优先)
+RoboCup 全行业标准答案:**永远不靠单帧几何配准定位**,而用 EKF/UKF 维护 SE2 位姿分布,
+每帧把检测到的每个地标作为独立观测更新滤波器(哪怕只看到1个点也能更新),里程计做预测步。
+**我的现状**:FusedPoseBelief 是"N帧点用里程计搬到当前帧→拼大点云→单次Kabsch"(observations.py:572-591),
+**这不是递归滤波**。朝同方向走时 N 帧看到同几个点,拼接约束不增加→这正是 EXP7"被动融合无效"的根因。
+→ EKF/UKF 把"单帧看4点欠定"变成"信息跨帧累积",且算力 O(1)、RoboCup 在 Nao 弱 CPU 实时跑。
+**这是带已知地图的定位(非SLAM),观测模型=地标投影,EKF 非常干净**。参考 B-Human SelfLocator、
+PythonRobotics UKF 实现。**性价比最高、改动最确定。**
+
+### 洞察2:对称二义性需单独处理(与洞察1正交)
+对称球场 Kabsch 会随机跳到镜像解→单这一项就造成大误差。CLAP(arXiv:2509.08495)思路:
+对每观测点生成对称假设→位姿空间聚类→真解聚成簇、虚假解分散。几何方法无需训练,可直接嫁接 Kabsch 输出。
+**我从未处理过镜像对称**——这可能是 pos_err 卡 1.5m 的一个隐藏贡献者。
+
+### 洞察3:主动视觉用熵减/信息增益驱动(我 EXP8-10 走的路,但方法可改进)
+Seekircher/Laue/Röfer 的熵减 next-best-view:维护 belief 熵,选最大化期望熵减的头角。
+**关键**:不必用 RL!我有地标3D坐标+相机模型,可解析预测"neck转到θ能看到哪些地标→协方差降多少",
+贪心选最优θ。比我 EXP8-10 用 RL 间接学扫视(教不动)更直接。arXiv:2011.13851 是 RL 版备选。
+
+### 洞察4:多技能冲突用 teacher distillation(线B 收尾用)
+DeepMind "Learning Agile Soccer Skills"(arXiv:2304.13653):先训单技能专家(找球定位/踢球)再蒸馏成
+统一策略,避免互相覆盖。这正是 codex C8 射门退化 + 我 EXP10 neck甩头破稳的解法。优先级排定位之后。
+
+### 路线重排(线A 方法升级)
+原线A=修融合bug重跑(EXP11进行中,仍是点云拼接Kabsch)。**新认知**:即使bug修好,点云拼接的
+天花板可能就在那;真正的提升要靠 EKF/UKF 递归滤波 + 对称消歧。
+→ EXP11 结果出来后,无论好坏,线A 下一步应是**把 FusedPoseBelief 从"点云拼接Kabsch"改造成"EKF/UKF递归滤波"**,
+并加对称消歧。主动扫视改用解析熵减(绕开 RL 教不动扫视的问题)。
+
+## 代码审查发现 #3(2026-06-09,EXP11 期间)— 扫视/门控 reward 一步滞后
+**机制**:step() 内 reward_manager.compute(line440) 在 observation_manager.compute(line464) **之前**运行。
+我的 active_scan/门控/monitor reward 读 term._last_uniq,而该缓存只在 FusedPoseBelief.__call__
+(obs compute 内)写入。→ 第 N 步 reward 读到的是第 N-1 步 obs 写的 uniq_frac。
+**严重度评估(诚实)**:
+- 稳态时:50Hz 下一步=20ms,belief 变化极小,门控/扫视奖励慢半拍→影响轻微,非系统性偏置,只是噪声。
+- **reset 后第一步更糟**:reset() 不清 _last_uniq(只清 buffer 行),第一步 reward 用的是**上一 episode**
+  的确定度→门控/扫视奖励在每个 episode 开头错位一帧。
+- active_scan 用 _last_uniq 当 reward 值,一步滞后让"奖励"与"产生它的动作"错配半拍,弱化 credit assignment。
+**结论**:这是真 bug 但严重度中低——不是 EXP8/9/10 扫视学不动的主因(那是间接奖励+点云拼接架构问题),
+但会给扫视学习加噪声。**修法**:reward 改为现场计算 uniq_frac(不读缓存),或 reset 时把 _last_uniq 清零。
+鉴于线A 要转向 EKF 重构,此 bug 留待重构时一并处理(EKF 版 reward 接口会重写),现在不单独热修。

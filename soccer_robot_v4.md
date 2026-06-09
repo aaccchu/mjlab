@@ -333,3 +333,8 @@ codex 红线仍守:oracle 检测隔离感知变量、安全课程先行、各阶
 ### 本次任务范围(线A,严格不蔓延)
 修 FusedPoseBelief append 节流 bug(全局计数器被部分 reset 每步清零→缓冲停滚→融合退化近单帧)→
 重跑 → **只回答:健康时序融合下纯视觉 pos_err 到多少、能否接近 0.79m**。不期望此步提升 goal_rate。
+
+## 十二、自定位方法论文档(2026-06-09)
+RoboCup 调研 + EKF 重构方案已独立存为 `soccer_robot_v4_localization_method.md`(方法论+R1/R2/R3 重构设计)。
+**核心转向**:当前"点云拼接+单次Kabsch"架构选错,EXP11 修 append bug 后仍 ~2.1m 印证天花板。
+线A 下一步=把 FusedPoseBelief 重构为 EKF/UKF 递归滤波(R1)+ 对称消歧(R2)+ 解析熵减主动视觉(R3)。
