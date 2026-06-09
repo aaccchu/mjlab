@@ -95,3 +95,14 @@
 - DeepMind 足球技能蒸馏:arxiv.org/abs/2304.13653
 - 多技能干扰理论:huggingface.co/papers/2606.02398
 - legged RL 综述:arxiv.org/html/2406.01152v2
+
+## EKF 实现代码审查(2026-06-09,subagent 审查)
+线A EKF(EkfPoseBelief)审查结论:**默认参数下无崩溃 bug**,印证 EXP13 0.98m 建立在正确实现上。
+- ✅ reset 三态(slice/tensor/None)安全;mu=None 时安全返回(reset 早于首次 __call__)。
+- ✅ reset 后首帧 NaN 里程计 delta 被 torch.where 完整归零,覆盖所有 reset env。
+- ✅ inv(S) 在 r_meas=0.10 下恒可逆(Rk=0.10/clamp(w,≥1e-3)∈[0.1,100] 恒正定)。
+**潜在数值脆弱点(非当前 bug,健壮性改进项,优先级低)**:
+1. 协方差用简单 (I-KH)Σ 形式且无对称化,长程理论上可能渐失正定。实践中 R 良态+trace clamp[0,50]
+   兜底未发散。改进:换 Joseph form 或每步 Σ=0.5(Σ+Σᵀ) 对称化。
+2. r_meas 入口无 >0 校验,若外部传 0 则 inv(S) 可奇异。改进:加断言。
+两者都不触发当前崩溃,EXP13 权重可信。若未来做 R2/真检测器再加固。
