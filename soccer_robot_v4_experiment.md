@@ -884,3 +884,19 @@ fell_over<0.1(踢球训练不能破坏线A定位与稳定) ③ ball_speed↑/bal
 - 诚实记录局限:goal_rate/ball_to_target 等 episode 级累积量因短窗口(400步)被低估
   (评估 goal 0.004 vs 训练 0.08),以训练日志为准;fell_over n=4 采样不足无意义。
   逐步量(pos_err/ball_speed)适合短窗口确证,episode 级量以训练日志为准。
+
+## EXP15 启动(2026-06-09,线B B2 改进:bug修复+调研驱动突破)
+EXP14 结果:goal_rate 0.08→0.11(+37%)、ball_to_tgt 2.97→2.45m,方向有效但卡0.11;
+out_of_bounds 0.21→0.28(印证spawn穿透bug)。codex经验+网络调研双重诊断后改动:
+**bug修复(确定)**:
+1. near_foot_dist下界0.08→0.25m(球半径0.11从root量会spawn进脚→穿透弹飞)。
+2. rear_spawn_fraction显式置0(原从fused_scan继承0.5与near_foot冲突)。
+**调研驱动突破**:
+3. kick_impulse加speed_threshold=0.6:只奖朝门球速>0.6的真踢,掐掉'温吞推球'局部最优
+   (EXP14 ball_speed卡0.39正是此症状)。
+4. spike重置std_param→1.0:bootstrap继承坍缩动作std(0.44-0.98)抑制'大力踢'探索,重开。
+**codex反证**:其冻结策略+外挂BC/teacher路线离线AUC0.99但闭环零进球(步态不兼容+部署分布shift),
+端到端RL天然绕开两杀手,方向正确,不必上BC。
+**判据**:① goal_rate能否突破0.11量级(目标→0.2)、ball_speed能否升(脱离0.39说明学会踢) ②
+护栏pos_err<1.1、fell_over<0.1、out_of_bounds回落(<0.25说明spawn修好) ③多seed验证防假阳性。
+对照EXP14: goal 0.11,success 0.42,ball_speed 0.40,oob 0.28,pos_err 0.97。日志/tmp/v4_exp15_full.log。
