@@ -859,3 +859,28 @@ bootstrap 全载无 mismatch,在线 EKF 正常运行。
   印证核心判断:踢球动作技能(B2)是独立缺失件,定位只能把球带到离门3m,从3m到进门的踢击仍缺技能。
 **线A 收官**:0.98m 达标。是否再加R2对称消歧榨到0.79m,优先级低于线B(goal_rate命门)。
 **下一步**:转线B,先做B2(近脚窗口spawn球专训踢球动作技能)。EXP13 model 作为后续bootstrap基线。
+
+## EXP14 启动(2026-06-09,线B B2:近脚踢球技能)
+针对踢球链断裂(EXP13 goal_rate 0.08,根因=动作技能缺失非感知/奖励)。三处改动:
+1. near_foot_spawn_fraction=0.5:一半episode球spawn在脚前踢击窗口(0.08-0.20m)密集练踢,
+   一半保持完整任务防遗忘。解决spawn_dist≥0.6m致踢击样本稀疏。
+2. dribble_kick_impulse(w1.5):接触步奖励球速朝门投影(踢击质量)。
+3. ekf_kick env+spike从EXP13 model_1999 bootstrap(继承定位0.98m+步态+接近)。
+smoke通过:全载/奖励激活/无错。
+**判据**:① goal_rate能否从0.08显著上升(目标→0.2)、episode_success↑ ② 护栏:pos_err不退化(<1.1)、
+fell_over<0.1(踢球训练不能破坏线A定位与稳定) ③ ball_speed↑/ball_stuck↓。
+对照EXP13:goal 0.08,success 0.40,pos_err 0.98,fell_over 0.057。日志/tmp/v4_exp14_full.log。
+
+## 线A 里程碑留痕归档(2026-06-09)
+线A EKF 自定位成功后的记录留痕工作(权重归档+评估确证):
+**权重归档** `checkpoints/v4_soccer/lineA_ekf_exp13/`:
+- model_1999.pt(最终权重,md5 28bdd74600d6f5a511ad11a94cc502ab)+ model_0.pt(起点,可复现)
+  + tensorboard events + git 快照 + README.md(完整背景/指标/复现方法)。
+- 防 logs 目录被后续实验覆盖,关键节点权重永久留存。
+**评估产物** `soccer_eval/2026-06-09_v4/lineA_ekf/`(脚本 scripts/eval_v4_lineA.py):
+- 视频 mp4(9env 500步)+ 4 预览 PNG + metrics.json + README(含方法学局限)。
+- **核心确证**:独立 headless 评估(128env,warmup150)pos_err median **0.99m**,
+  精确复现训练稳态 0.98m → 线A 归档数字可信。
+- 诚实记录局限:goal_rate/ball_to_target 等 episode 级累积量因短窗口(400步)被低估
+  (评估 goal 0.004 vs 训练 0.08),以训练日志为准;fell_over n=4 采样不足无意义。
+  逐步量(pos_err/ball_speed)适合短窗口确证,episode 级量以训练日志为准。

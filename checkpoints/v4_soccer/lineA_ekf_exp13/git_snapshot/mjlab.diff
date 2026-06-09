@@ -1,0 +1,236 @@
+--- git commit ---
+f5a37a09b74eaa1501cf16a355d3e3fe6bb441d6
+
+
+--- git status ---
+On branch main
+Your branch is ahead of 'origin/main' by 5 commits.
+  (use "git push" to publish your local commits)
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   soccer_robot_v4_experiment.md
+	modified:   src/mjlab/tasks/velocity/config/mos92/env_cfgs.py
+	modified:   src/mjlab/tasks/velocity/mdp/observations.py
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	scripts/spike_v4_e2e_ekf.py
+
+no changes added to commit (use "git add" and/or "git commit -a") 
+
+
+--- git diff ---
+diff --git a/soccer_robot_v4_experiment.md b/soccer_robot_v4_experiment.md
+index 888602d7..46080081 100644
+--- a/soccer_robot_v4_experiment.md
++++ b/soccer_robot_v4_experiment.md
+@@ -832,3 +832,17 @@ DeepMind "Learning Agile Soccer Skills"(arXiv:2304.13653):先训单技能专家(
+ ② 真实 rollout 对比(本结果)。EKF 公式见 scripts/exp12_offline_ekf.py:_ekf_step。
+ **下一步**:R1 把 FusedPoseBelief 重构为在线 EKF(用此验证过的 _ekf_step),重训看 pos_err 能否破 1m。
+ 踩坑:验证脚本须用训练时同一 env(fused_scan,obs 88维)才能加载策略;_collect_frame 前须 _ensure_init。
++
++## EXP13 启动(2026-06-09,线A R1:在线 EKF 重构)
++EXP12 离线验证(EKF 1.21m vs 点云拼接 2.68m,+55%)后的正式重构:
++- 新类 `EkfPoseBelief`(observations.py,继承 FusedPoseBelief 复用 _collect_frame)= 有状态 per-env SE2-EKF。
++  predict 用 GT 里程计 delta,update 对每个可见地标做序贯 EKF 校正。输出仍 7 维同布局
++  [x_n,y_n,sin,cos,vis_now,uniq_frac,uncertainty],第7维 resid→EKF 协方差迹(真不确定度)。
++- 新 env `mos92_soccer_e2e_dualcam_ekf_env_cfg`(派生 fused_scan,保留 active_scan+松 neck,换 EKF belief)。
++- 脚本 `scripts/spike_v4_e2e_ekf.py`,从 EXP11 model_1999(88维同结构)全载 bootstrap,继承步态+踢球。
++- monitor fused_belief_error 因 isinstance(EkfPoseBelief 是 FusedPoseBelief 子类)自动匹配,pos_err 日志正确。
++**smoke 结果(关键)**:selfloc_pos_err_m 训练初就 **~1.08-1.26m**(吻合离线 1.21m),远好于点云拼接 ~2.1m,
++bootstrap 全载无 mismatch,在线 EKF 正常运行。
++**判据**:① pos_err 能否随训练稳定破 1m、趋近 0.79m ② fell_over 保持低(EKF 是 obs 不污染步态,应稳)
++③ goal_rate(不期望此步提升,线B 才是命门)。日志 /tmp/v4_exp13_full.log。
++对照:EXP11(点云拼接)末100 pos_err 2.125m。
+diff --git a/src/mjlab/tasks/velocity/config/mos92/env_cfgs.py b/src/mjlab/tasks/velocity/config/mos92/env_cfgs.py
+index c6469de8..60880e61 100644
+--- a/src/mjlab/tasks/velocity/config/mos92/env_cfgs.py
++++ b/src/mjlab/tasks/velocity/config/mos92/env_cfgs.py
+@@ -1449,3 +1449,38 @@ def mos92_soccer_e2e_dualcam_neck_motion_env_cfg(
+     params={"command_name": "dribble", "certain_frac": 0.4, "vel_scale": 2.0},
+   )
+   return cfg
++
++
++def mos92_soccer_e2e_dualcam_ekf_env_cfg(
++  play: bool = False,
++) -> ManagerBasedRlEnvCfg:
++  """v4 line-A R1: RECURSIVE EKF self-localization. EXP12 offline proved a recursive
++  SE2-EKF beats the point-cloud-pooling Kabsch of FusedPoseBelief by 55% (1.21m vs
++  2.68m mean pos_err) on the SAME rollout — pooling adds no constraint when the robot
++  walks one way, the EKF accumulates each sparse landmark observation recursively.
++
++  Derives from fused_scan (keeps active_scan reward + relaxed neck so scanning is
++  still incentivized) and swaps FusedPoseBelief -> EkfPoseBelief. Output stays 7-dim
++  with the same layout, so the actor obs dim is unchanged and EXP11 weights bootstrap
++  directly. The fused_belief_error monitor matches EkfPoseBelief too (it subclasses
++  FusedPoseBelief), so Metrics/selfloc_pos_err_m logs the EKF belief automatically.
++  Still oracle DETECTION (isolate the detector variable, per codex's stage order).
++  """
++  cfg = mos92_soccer_e2e_dualcam_fused_scan_env_cfg(play=play)
++
++  cfg.observations["actor"].terms["ball_to_target"] = ObservationTermCfg(
++    func=mdp.EkfPoseBelief(
++      None,  # type: ignore[arg-type]  # env injected lazily on first call
++      command_name="dribble",
++      sensor_name="head_cam",
++      num_frames=8,
++      stride=4,
++    ),
++    params={
++      "command_name": "dribble",
++      "sensor_name": "head_cam",
++      "num_frames": 8,
++      "stride": 4,
++    },
++  )
++  return cfg
+diff --git a/src/mjlab/tasks/velocity/mdp/observations.py b/src/mjlab/tasks/velocity/mdp/observations.py
+index 4b13b852..000b2da1 100644
+--- a/src/mjlab/tasks/velocity/mdp/observations.py
++++ b/src/mjlab/tasks/velocity/mdp/observations.py
+@@ -612,3 +612,142 @@ class FusedPoseBelief(ManagerTermBase):
+     return torch.stack(
+       [x_n, y_n, sinr, cosr, vis_now, uniq_frac, resid], dim=-1
+     )  # (B,7)
++
++
++class EkfPoseBelief(FusedPoseBelief):
++  """v4 line-A R1: RECURSIVE SE2-EKF self-localization, replacing the point-cloud-
++  pooling Kabsch of FusedPoseBelief. EXP12 offline (same rollout, same per-landmark
++  depth obs) showed the EKF beats pooling by 55% (1.21m vs 2.68m mean) — pooling
++  N frames adds no constraint when the robot walks one way (same ~4 points repeat),
++  whereas the EKF accumulates each sparse per-frame landmark observation recursively
++  into a pose distribution, so even underdetermined single frames converge.
++
++  State (per env): mu (B,3) [x,y,yaw] world pose, Sigma (B,3,3) covariance.
++  Predict: world-frame pose += GT odometry delta, inflate covariance by Q.
++  Update: sequential per-visible-landmark EKF correction against the known map.
++  Reset: the reset envs go back to a wide prior (field center, large covariance).
++
++  Output (B,7), same layout as FusedPoseBelief so the actor obs dim is unchanged and
++  EXP11 weights bootstrap directly:
++    [x_n, y_n, sin_yaw, cos_yaw, vis_frac_now, uniq_frac, uncertainty]
++  uniq_frac is the per-step visible fraction (active-scan signal); uncertainty is the
++  normalized covariance trace (replaces the pooling residual — a real belief spread).
++  The _ekf_step math is the one validated in scripts/exp12_offline_ekf.py.
++  """
++
++  def __init__(self, env, command_name, sensor_name="head_cam", num_frames=8,
++               stride=4, q_pos=0.02, q_yaw=0.02, r_meas=0.10):
++    super().__init__(env, command_name, sensor_name, num_frames, stride)
++    self._q_pos = q_pos
++    self._q_yaw = q_yaw
++    self._r_meas = r_meas
++    self._mu = None       # (B,3)
++    self._Sigma = None    # (B,3,3)
++    self._prev_gt = None  # (B,3) previous GT world base pose for odometry delta
++    self._map_xy = None   # (K,2)
++
++  def _ensure_init(self, env: ManagerBasedRlEnv) -> None:
++    super()._ensure_init(env)
++    if self._mu is not None:
++      return
++    B, dev = env.num_envs, env.device
++    self._map_xy = self._kp_local[:, :2].clone()  # (K,2) world landmark xy
++    self._mu = torch.zeros(B, 3, device=dev)
++    self._Sigma = torch.diag(
++      torch.tensor([25.0, 25.0, 9.0], device=dev)
++    ).repeat(B, 1, 1)
++    self._prev_gt = None
++    self._Q = torch.diag(
++      torch.tensor([self._q_pos, self._q_pos, self._q_yaw], device=dev)
++    )
++    self._R = torch.eye(2, device=dev) * self._r_meas
++
++  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
++    if self._mu is None:
++      return
++    dev = self._mu.device
++    if isinstance(env_ids, slice):
++      ids = torch.arange(self._mu.shape[0], device=dev)
++    else:
++      ids = env_ids
++    # Reset envs go back to the wide prior; clear their odometry anchor so the
++    # first post-reset frame does not apply a bogus cross-episode delta.
++    self._mu[ids] = 0.0
++    self._Sigma[ids] = torch.diag(
++      torch.tensor([25.0, 25.0, 9.0], device=dev)
++    )
++    if self._prev_gt is not None:
++      self._prev_gt[ids] = float("nan")  # NaN marks "no valid previous pose"
++
++  def __call__(self, env, command_name, sensor_name="head_cam", num_frames=8,
++               stride=4) -> torch.Tensor:
++    self._ensure_init(env)
++    frame = self._collect_frame(env)  # (B, 3K+3)
++    K, B, dev = self._K, env.num_envs, env.device
++    z_x, z_y = frame[:, 0:K], frame[:, K:2 * K]
++    z_w = frame[:, 2 * K:3 * K]               # (B,K) visibility weight
++    z_xy = torch.stack([z_x, z_y], dim=-1)    # (B,K,2) base-frame landmark obs
++    gt_world = frame[:, 3 * K:]               # (B,3) GT base pose (odometry source)
++
++    # --- Predict: advance pose by GT odometry delta (NaN-safe for first frame). ---
++    if self._prev_gt is None:
++      self._prev_gt = gt_world.clone()
++      delta = torch.zeros(B, 3, device=dev)
++    else:
++      delta = gt_world - self._prev_gt
++      delta[:, 2] = torch.atan2(torch.sin(delta[:, 2]), torch.cos(delta[:, 2]))
++      # Envs just reset have NaN prev -> zero delta (start fresh from prior).
++      delta = torch.where(torch.isnan(delta), torch.zeros_like(delta), delta)
++      self._prev_gt = gt_world.clone()
++    self._mu = self._mu + delta
++    self._mu[:, 2] = torch.atan2(torch.sin(self._mu[:, 2]), torch.cos(self._mu[:, 2]))
++    self._Sigma = self._Sigma + self._Q.unsqueeze(0)
++
++    # --- Update: sequential per-landmark EKF correction. ---
++    for k in range(K):
++      w = z_w[:, k]
++      if float(w.max()) <= 0.0:
++        continue
++      x, y, yaw = self._mu[:, 0], self._mu[:, 1], self._mu[:, 2]
++      c, s = torch.cos(yaw), torch.sin(yaw)
++      dx = self._map_xy[k, 0] - x
++      dy = self._map_xy[k, 1] - y
++      hx = c * dx + s * dy
++      hy = -s * dx + c * dy
++      H = torch.zeros(B, 2, 3, device=dev)
++      H[:, 0, 0] = -c
++      H[:, 0, 1] = -s
++      H[:, 0, 2] = hy
++      H[:, 1, 0] = s
++      H[:, 1, 1] = -c
++      H[:, 1, 2] = -hx
++      innov = torch.stack([z_xy[:, k, 0] - hx, z_xy[:, k, 1] - hy], dim=-1)
++      Rk = self._R / w.clamp(min=1e-3).unsqueeze(-1).unsqueeze(-1)
++      S = H @ self._Sigma @ H.transpose(1, 2) + Rk
++      Kg = self._Sigma @ H.transpose(1, 2) @ torch.linalg.inv(S)
++      upd = (Kg @ innov.unsqueeze(-1)).squeeze(-1)
++      m = (w > 0).float().unsqueeze(-1)
++      self._mu = self._mu + m * upd
++      eye3 = torch.eye(3, device=dev).unsqueeze(0)
++      Sig_new = (eye3 - Kg @ H) @ self._Sigma
++      self._Sigma = self._Sigma + m.unsqueeze(-1) * (Sig_new - self._Sigma)
++      self._mu[:, 2] = torch.atan2(
++        torch.sin(self._mu[:, 2]), torch.cos(self._mu[:, 2])
++      )
++
++    # --- Pack output (B,7), same layout as FusedPoseBelief. ---
++    command = _dribble_cmd(env, command_name)
++    x_n = self._mu[:, 0] / command.cfg.half_length
++    y_n = self._mu[:, 1] / command.cfg.half_width
++    yaw = self._mu[:, 2]
++    vis_now = z_w.sum(1) / float(K)
++    uniq_frac = (z_w > 0).float().sum(1) / float(K)
++    # Normalized covariance trace (x,y) as belief uncertainty, ~[0,1] after clamp.
++    uncertainty = (self._Sigma[:, 0, 0] + self._Sigma[:, 1, 1]).clamp(0, 50.0) / 50.0
++    self._last_uniq = uniq_frac.detach()
++    self._last_resid = uncertainty.detach()
++    self._last_xy_n = torch.stack([x_n, y_n], dim=-1).detach()
++    return torch.stack(
++      [x_n, y_n, torch.sin(yaw), torch.cos(yaw), vis_now, uniq_frac, uncertainty],
++      dim=-1,
++    )  # (B,7)
