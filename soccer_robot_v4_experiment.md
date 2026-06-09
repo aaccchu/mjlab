@@ -832,3 +832,17 @@ DeepMind "Learning Agile Soccer Skills"(arXiv:2304.13653):先训单技能专家(
 ② 真实 rollout 对比(本结果)。EKF 公式见 scripts/exp12_offline_ekf.py:_ekf_step。
 **下一步**:R1 把 FusedPoseBelief 重构为在线 EKF(用此验证过的 _ekf_step),重训看 pos_err 能否破 1m。
 踩坑:验证脚本须用训练时同一 env(fused_scan,obs 88维)才能加载策略;_collect_frame 前须 _ensure_init。
+
+## EXP13 启动(2026-06-09,线A R1:在线 EKF 重构)
+EXP12 离线验证(EKF 1.21m vs 点云拼接 2.68m,+55%)后的正式重构:
+- 新类 `EkfPoseBelief`(observations.py,继承 FusedPoseBelief 复用 _collect_frame)= 有状态 per-env SE2-EKF。
+  predict 用 GT 里程计 delta,update 对每个可见地标做序贯 EKF 校正。输出仍 7 维同布局
+  [x_n,y_n,sin,cos,vis_now,uniq_frac,uncertainty],第7维 resid→EKF 协方差迹(真不确定度)。
+- 新 env `mos92_soccer_e2e_dualcam_ekf_env_cfg`(派生 fused_scan,保留 active_scan+松 neck,换 EKF belief)。
+- 脚本 `scripts/spike_v4_e2e_ekf.py`,从 EXP11 model_1999(88维同结构)全载 bootstrap,继承步态+踢球。
+- monitor fused_belief_error 因 isinstance(EkfPoseBelief 是 FusedPoseBelief 子类)自动匹配,pos_err 日志正确。
+**smoke 结果(关键)**:selfloc_pos_err_m 训练初就 **~1.08-1.26m**(吻合离线 1.21m),远好于点云拼接 ~2.1m,
+bootstrap 全载无 mismatch,在线 EKF 正常运行。
+**判据**:① pos_err 能否随训练稳定破 1m、趋近 0.79m ② fell_over 保持低(EKF 是 obs 不污染步态,应稳)
+③ goal_rate(不期望此步提升,线B 才是命门)。日志 /tmp/v4_exp13_full.log。
+对照:EXP11(点云拼接)末100 pos_err 2.125m。

@@ -1449,3 +1449,38 @@ def mos92_soccer_e2e_dualcam_neck_motion_env_cfg(
     params={"command_name": "dribble", "certain_frac": 0.4, "vel_scale": 2.0},
   )
   return cfg
+
+
+def mos92_soccer_e2e_dualcam_ekf_env_cfg(
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """v4 line-A R1: RECURSIVE EKF self-localization. EXP12 offline proved a recursive
+  SE2-EKF beats the point-cloud-pooling Kabsch of FusedPoseBelief by 55% (1.21m vs
+  2.68m mean pos_err) on the SAME rollout — pooling adds no constraint when the robot
+  walks one way, the EKF accumulates each sparse landmark observation recursively.
+
+  Derives from fused_scan (keeps active_scan reward + relaxed neck so scanning is
+  still incentivized) and swaps FusedPoseBelief -> EkfPoseBelief. Output stays 7-dim
+  with the same layout, so the actor obs dim is unchanged and EXP11 weights bootstrap
+  directly. The fused_belief_error monitor matches EkfPoseBelief too (it subclasses
+  FusedPoseBelief), so Metrics/selfloc_pos_err_m logs the EKF belief automatically.
+  Still oracle DETECTION (isolate the detector variable, per codex's stage order).
+  """
+  cfg = mos92_soccer_e2e_dualcam_fused_scan_env_cfg(play=play)
+
+  cfg.observations["actor"].terms["ball_to_target"] = ObservationTermCfg(
+    func=mdp.EkfPoseBelief(
+      None,  # type: ignore[arg-type]  # env injected lazily on first call
+      command_name="dribble",
+      sensor_name="head_cam",
+      num_frames=8,
+      stride=4,
+    ),
+    params={
+      "command_name": "dribble",
+      "sensor_name": "head_cam",
+      "num_frames": 8,
+      "stride": 4,
+    },
+  )
+  return cfg

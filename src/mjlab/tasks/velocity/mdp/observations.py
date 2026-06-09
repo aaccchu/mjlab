@@ -612,3 +612,142 @@ class FusedPoseBelief(ManagerTermBase):
     return torch.stack(
       [x_n, y_n, sinr, cosr, vis_now, uniq_frac, resid], dim=-1
     )  # (B,7)
+
+
+class EkfPoseBelief(FusedPoseBelief):
+  """v4 line-A R1: RECURSIVE SE2-EKF self-localization, replacing the point-cloud-
+  pooling Kabsch of FusedPoseBelief. EXP12 offline (same rollout, same per-landmark
+  depth obs) showed the EKF beats pooling by 55% (1.21m vs 2.68m mean) — pooling
+  N frames adds no constraint when the robot walks one way (same ~4 points repeat),
+  whereas the EKF accumulates each sparse per-frame landmark observation recursively
+  into a pose distribution, so even underdetermined single frames converge.
+
+  State (per env): mu (B,3) [x,y,yaw] world pose, Sigma (B,3,3) covariance.
+  Predict: world-frame pose += GT odometry delta, inflate covariance by Q.
+  Update: sequential per-visible-landmark EKF correction against the known map.
+  Reset: the reset envs go back to a wide prior (field center, large covariance).
+
+  Output (B,7), same layout as FusedPoseBelief so the actor obs dim is unchanged and
+  EXP11 weights bootstrap directly:
+    [x_n, y_n, sin_yaw, cos_yaw, vis_frac_now, uniq_frac, uncertainty]
+  uniq_frac is the per-step visible fraction (active-scan signal); uncertainty is the
+  normalized covariance trace (replaces the pooling residual — a real belief spread).
+  The _ekf_step math is the one validated in scripts/exp12_offline_ekf.py.
+  """
+
+  def __init__(self, env, command_name, sensor_name="head_cam", num_frames=8,
+               stride=4, q_pos=0.02, q_yaw=0.02, r_meas=0.10):
+    super().__init__(env, command_name, sensor_name, num_frames, stride)
+    self._q_pos = q_pos
+    self._q_yaw = q_yaw
+    self._r_meas = r_meas
+    self._mu = None       # (B,3)
+    self._Sigma = None    # (B,3,3)
+    self._prev_gt = None  # (B,3) previous GT world base pose for odometry delta
+    self._map_xy = None   # (K,2)
+
+  def _ensure_init(self, env: ManagerBasedRlEnv) -> None:
+    super()._ensure_init(env)
+    if self._mu is not None:
+      return
+    B, dev = env.num_envs, env.device
+    self._map_xy = self._kp_local[:, :2].clone()  # (K,2) world landmark xy
+    self._mu = torch.zeros(B, 3, device=dev)
+    self._Sigma = torch.diag(
+      torch.tensor([25.0, 25.0, 9.0], device=dev)
+    ).repeat(B, 1, 1)
+    self._prev_gt = None
+    self._Q = torch.diag(
+      torch.tensor([self._q_pos, self._q_pos, self._q_yaw], device=dev)
+    )
+    self._R = torch.eye(2, device=dev) * self._r_meas
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    if self._mu is None:
+      return
+    dev = self._mu.device
+    if isinstance(env_ids, slice):
+      ids = torch.arange(self._mu.shape[0], device=dev)
+    else:
+      ids = env_ids
+    # Reset envs go back to the wide prior; clear their odometry anchor so the
+    # first post-reset frame does not apply a bogus cross-episode delta.
+    self._mu[ids] = 0.0
+    self._Sigma[ids] = torch.diag(
+      torch.tensor([25.0, 25.0, 9.0], device=dev)
+    )
+    if self._prev_gt is not None:
+      self._prev_gt[ids] = float("nan")  # NaN marks "no valid previous pose"
+
+  def __call__(self, env, command_name, sensor_name="head_cam", num_frames=8,
+               stride=4) -> torch.Tensor:
+    self._ensure_init(env)
+    frame = self._collect_frame(env)  # (B, 3K+3)
+    K, B, dev = self._K, env.num_envs, env.device
+    z_x, z_y = frame[:, 0:K], frame[:, K:2 * K]
+    z_w = frame[:, 2 * K:3 * K]               # (B,K) visibility weight
+    z_xy = torch.stack([z_x, z_y], dim=-1)    # (B,K,2) base-frame landmark obs
+    gt_world = frame[:, 3 * K:]               # (B,3) GT base pose (odometry source)
+
+    # --- Predict: advance pose by GT odometry delta (NaN-safe for first frame). ---
+    if self._prev_gt is None:
+      self._prev_gt = gt_world.clone()
+      delta = torch.zeros(B, 3, device=dev)
+    else:
+      delta = gt_world - self._prev_gt
+      delta[:, 2] = torch.atan2(torch.sin(delta[:, 2]), torch.cos(delta[:, 2]))
+      # Envs just reset have NaN prev -> zero delta (start fresh from prior).
+      delta = torch.where(torch.isnan(delta), torch.zeros_like(delta), delta)
+      self._prev_gt = gt_world.clone()
+    self._mu = self._mu + delta
+    self._mu[:, 2] = torch.atan2(torch.sin(self._mu[:, 2]), torch.cos(self._mu[:, 2]))
+    self._Sigma = self._Sigma + self._Q.unsqueeze(0)
+
+    # --- Update: sequential per-landmark EKF correction. ---
+    for k in range(K):
+      w = z_w[:, k]
+      if float(w.max()) <= 0.0:
+        continue
+      x, y, yaw = self._mu[:, 0], self._mu[:, 1], self._mu[:, 2]
+      c, s = torch.cos(yaw), torch.sin(yaw)
+      dx = self._map_xy[k, 0] - x
+      dy = self._map_xy[k, 1] - y
+      hx = c * dx + s * dy
+      hy = -s * dx + c * dy
+      H = torch.zeros(B, 2, 3, device=dev)
+      H[:, 0, 0] = -c
+      H[:, 0, 1] = -s
+      H[:, 0, 2] = hy
+      H[:, 1, 0] = s
+      H[:, 1, 1] = -c
+      H[:, 1, 2] = -hx
+      innov = torch.stack([z_xy[:, k, 0] - hx, z_xy[:, k, 1] - hy], dim=-1)
+      Rk = self._R / w.clamp(min=1e-3).unsqueeze(-1).unsqueeze(-1)
+      S = H @ self._Sigma @ H.transpose(1, 2) + Rk
+      Kg = self._Sigma @ H.transpose(1, 2) @ torch.linalg.inv(S)
+      upd = (Kg @ innov.unsqueeze(-1)).squeeze(-1)
+      m = (w > 0).float().unsqueeze(-1)
+      self._mu = self._mu + m * upd
+      eye3 = torch.eye(3, device=dev).unsqueeze(0)
+      Sig_new = (eye3 - Kg @ H) @ self._Sigma
+      self._Sigma = self._Sigma + m.unsqueeze(-1) * (Sig_new - self._Sigma)
+      self._mu[:, 2] = torch.atan2(
+        torch.sin(self._mu[:, 2]), torch.cos(self._mu[:, 2])
+      )
+
+    # --- Pack output (B,7), same layout as FusedPoseBelief. ---
+    command = _dribble_cmd(env, command_name)
+    x_n = self._mu[:, 0] / command.cfg.half_length
+    y_n = self._mu[:, 1] / command.cfg.half_width
+    yaw = self._mu[:, 2]
+    vis_now = z_w.sum(1) / float(K)
+    uniq_frac = (z_w > 0).float().sum(1) / float(K)
+    # Normalized covariance trace (x,y) as belief uncertainty, ~[0,1] after clamp.
+    uncertainty = (self._Sigma[:, 0, 0] + self._Sigma[:, 1, 1]).clamp(0, 50.0) / 50.0
+    self._last_uniq = uniq_frac.detach()
+    self._last_resid = uncertainty.detach()
+    self._last_xy_n = torch.stack([x_n, y_n], dim=-1).detach()
+    return torch.stack(
+      [x_n, y_n, torch.sin(yaw), torch.cos(yaw), vis_now, uniq_frac, uncertainty],
+      dim=-1,
+    )  # (B,7)
