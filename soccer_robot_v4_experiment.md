@@ -927,3 +927,14 @@ out_of_bounds 0.21→0.28(印证spawn穿透bug)。codex经验+网络调研双重
 - fell_over 0.05→0.126**翻倍且剧烈震荡**(0~0.33反复): std重置1.0过猛,动作太乱,508iter未自愈。
 - goal_rate 0.109无突破。
 => 结论: threshold应设低或用渐进课程; std重置1.0太激进应temper(如0.85)或配entropy退火。
+
+## EXP16 启动(2026-06-09,指标改进+EXP15参数修正)
+EXP15中止(threshold0.6掐死奖励致ball_speed反降、std1.0致fell_over翻倍)。修正后启动:
+**指标改进**(用户要求检查指标体系):
+- 新主目标=真实射门率(goal_rate/target_is_goal,球门子集进球率)。全局goal_rate被
+  goal_target_fraction=0.5压低上限,0.2全局≈0.4子集。目标设子集50-60%。
+- 加ball_speed_peak区分慢推vs真踢(均值掩盖)。smoke峰值1.19说明策略有踢力只是不持续。
+**参数修正**: threshold 0.6→0.3(略高于轻推可够着,不掐死信号);std重置1.0→0.85(温和重开探索)。
+**判据**: ① 真实射门率能否升(脱离子集~0.2→目标0.5) ② ball_speed_peak能否升(学会真踢) ③
+护栏: fell_over回落<0.1(验证std0.85不失稳)、out_of_bounds<0.25(验证spawn修好)、pos_err<1.1。
+对照EXP14(全局goal0.11≈子集0.22, fell0.07, oob0.28)。日志/tmp/v4_exp16_full.log。
