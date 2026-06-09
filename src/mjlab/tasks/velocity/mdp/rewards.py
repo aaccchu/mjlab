@@ -613,6 +613,31 @@ def goal_scored_bonus(
   return command.newly_scored
 
 
+def out_of_bounds_penalty(
+  env: ManagerBasedRlEnv,
+  term_name: str = "out_of_field_bounds",
+) -> torch.Tensor:
+  """v4 EXP17: one-shot penalty at the step the robot is flagged out of bounds.
+
+  Register with a NEGATIVE weight. Returns a per-env 0/1 mask of the OOB
+  termination this step (read from the termination manager, which the env
+  computes BEFORE rewards). Pair this with ``out_of_field_bounds`` set to
+  ``time_out=False`` (a real termination, not a truncation): the original
+  config marked OOB as ``time_out=True``, so PPO bootstrapped ``gamma * V`` at
+  the OOB step (rsl_rl ppo.py) — telling the policy "leaving the field is as
+  valuable as continuing", i.e. OOB went unpenalized. Flipping to
+  ``time_out=False`` stops the bootstrap; this term adds the explicit cost so
+  the policy first *feels* a price for crossing the line.
+
+  Because rewards are dt-scaled (~0.02 s/step), the per-step value here is
+  multiplied by weight*dt; size the weight so weight*dt is comparable to a
+  meaningful fraction of the goal bonus (goal_scored weight 5, also a one-shot).
+  """
+  term = env.termination_manager.get_term(term_name)
+  env.extras["log"]["Metrics/oob_penalty_frac"] = term.float().mean()
+  return term.float()
+
+
 def goal_progress(
   env: ManagerBasedRlEnv,
   command_name: str,
@@ -994,7 +1019,9 @@ def keypoint_detection_accuracy(
   kp_local = field_keypoints_3d(env.device)
   K = kp_local.shape[0]
   kp_world = kp_local.unsqueeze(0) + origin.unsqueeze(1)
-  uv_gt, vis = project_keypoints(kp_world, cam_pos, cam_mat, fovy, W, H)  # (B,K,2),(B,K)
+  uv_gt, vis = project_keypoints(
+    kp_world, cam_pos, cam_mat, fovy, W, H
+  )  # (B,K,2),(B,K)
   uv_pred = pred.view(-1, K, 2)
   err = torch.linalg.norm(uv_pred - uv_gt, dim=-1)  # (B,K) normalized-pixel L2
   w = vis.float()
@@ -1059,7 +1086,8 @@ def keypoint_pose_error(
 
   valid = (depth_at > 0.05) & (depth_at < 30.0)
   yaw_r, t_r = kabsch_se2(
-    p_base[..., :2], kp_local[..., :2].unsqueeze(0).expand(p_base.shape[0], -1, -1),
+    p_base[..., :2],
+    kp_local[..., :2].unsqueeze(0).expand(p_base.shape[0], -1, -1),
     valid.float(),
   )
   origin = env.scene.env_origins
@@ -1067,8 +1095,6 @@ def keypoint_pose_error(
   pos_err_m = torch.linalg.norm(t_r - gt_xy, dim=-1)
   env.extras["log"]["Metrics/kp_selfloc_pos_err_m"] = pos_err_m.mean()
   return torch.zeros(p_base.shape[0], device=env.device)
-
-
 
 
 def oracle_pose_belief_error(

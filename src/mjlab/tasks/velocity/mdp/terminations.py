@@ -73,20 +73,48 @@ def out_of_field_bounds(
   half_length: float = 11.0,
   half_width: float = 7.0,
   margin: float = 0.3,
+  goal_corridor_half_width: float = 0.0,
+  goal_buffer: float = 0.0,
   asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-  """Truncate if the robot leaves a fixed rectangular field footprint.
+  """Out-of-bounds detector for the soccer-field task.
 
-  Soft boundary for the soccer-field task: the field spans
-  ``x in [-half_length, half_length]`` and ``y in [-half_width, half_width]``
-  (outer-edge basis). The robot is truncated when its root link crosses the
-  bound shrunk by ``margin``, so it learns to stay inside the side/goal lines.
+  The field spans ``x in [-half_length, half_length]`` and
+  ``y in [-half_width, half_width]`` (outer-edge basis). The robot is flagged
+  when its root link crosses the bound shrunk by ``margin``, so it learns to
+  stay inside the side/goal lines.
+
+  Goal corridor (EXP17, ``goal_corridor_half_width > 0``): a robot that strikes
+  the ball goalward naturally over-runs the goal line by its body length, and
+  with ``goal_line_x == half_length`` the OOB line at ``half_length - margin``
+  sits *inside* the field, penalizing legitimate shots. When the root is within
+  the goal mouth corridor (``|y| < goal_corridor_half_width``), the +/-x limit
+  is relaxed to ``half_length + goal_buffer`` so charging into the mouth to
+  shoot is not treated as leaving the field. Side lines (``y``) and the
+  off-corridor end lines are unchanged. ``goal_corridor_half_width = 0`` (the
+  default) disables the corridor and recovers the plain rectangular bound.
   """
   asset: Entity = env.scene[asset_cfg.name]
   root_xy_w = asset.data.root_link_pos_w[:, :2]
-  limit_x = max(0.0, half_length - margin)
   limit_y = max(0.0, half_width - margin)
-  return (root_xy_w[:, 0].abs() > limit_x) | (root_xy_w[:, 1].abs() > limit_y)
+  out_y = root_xy_w[:, 1].abs() > limit_y
+
+  base_limit_x = max(0.0, half_length - margin)
+  if goal_corridor_half_width > 0.0:
+    # In the goal mouth corridor the end-line limit is pushed out by the buffer;
+    # elsewhere it stays at the standard inset bound.
+    in_corridor = root_xy_w[:, 1].abs() < goal_corridor_half_width
+    corridor_limit_x = max(0.0, half_length + goal_buffer)
+    limit_x = torch.where(
+      in_corridor,
+      torch.full_like(root_xy_w[:, 0], corridor_limit_x),
+      torch.full_like(root_xy_w[:, 0], base_limit_x),
+    )
+    out_x = root_xy_w[:, 0].abs() > limit_x
+  else:
+    out_x = root_xy_w[:, 0].abs() > base_limit_x
+
+  return out_x | out_y
 
 
 def terrain_edge_reached(

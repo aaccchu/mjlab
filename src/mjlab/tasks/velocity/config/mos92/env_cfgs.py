@@ -1536,3 +1536,69 @@ def mos92_soccer_e2e_dualcam_ekf_kick_env_cfg(
     },
   )
   return cfg
+
+
+def mos92_soccer_e2e_dualcam_ekf_kick_oob_env_cfg(
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """v4 EXP17: fix the out-of-bounds semantic bug on top of EXP16's kick env.
+
+  EXP16 reached the best kick chain so far (real shot rate 0.32, fell_over
+  0.044, pos_err 0.91) but out_of_bounds rose to 0.345. The root cause is a
+  termination-semantics bug, verified three ways (code + data + literature, see
+  ``v4越界处理调研.md``): ``out_of_field_bounds`` was marked ``time_out=True``,
+  so PPO's truncation bootstrap added ``gamma * V(post-OOB)`` to the reward at
+  the OOB step (rsl_rl ppo.py) — i.e. it told the policy that leaving the field
+  is exactly as valuable as continuing. OOB was therefore *unpenalized*, and it
+  grew as a free side effect of learning to strike goalward (out_bnd vs
+  goal_rate correlation +0.514). By contrast ``fell_over`` correctly uses
+  ``time_out=False`` — OOB was the lone mislabeled failure.
+
+  This env applies the research doc's steps 1 + 2 together (deliberately, so the
+  fix does not make the policy timid about chasing the ball):
+    1. Flip ``out_of_field_bounds`` to ``time_out=False`` (a real termination,
+       no bootstrap) and add an explicit one-shot ``out_of_bounds_penalty``.
+    2. Open a goal-mouth corridor: inside ``|y| < goal_corridor_half_width`` the
+       end-line OOB limit is pushed out by ``goal_buffer`` so charging into the
+       mouth to shoot is legal. Side lines and off-corridor end lines unchanged.
+
+  Everything else is inherited from EXP16 unchanged (near-foot spawn, kick
+  impulse, std). Bootstraps from EXP16 model_1999 with NO std reset — the kick
+  skill is already learned; we only retune the boundary incentive.
+
+  Criteria: out_of_bounds drops toward <=0.20 WHILE the real shot rate
+  (goal_rate/target_is_goal) holds near 0.32 and fell_over / pos_err stay put.
+  Watch for the failure mode the research flagged: if shot rate collapses or
+  robot_to_ball rises, the OOB penalty is too harsh / corridor too narrow.
+  """
+  cfg = mos92_soccer_e2e_dualcam_ekf_kick_env_cfg(play=play)
+
+  field_cfg = SoccerFieldCfg()
+  # Goal mouth opening is |y| < 1.0 (goal_inner_half_width); give the corridor a
+  # little slack so a robot lined up to shoot is not clipped by the side of it.
+  goal_corridor_half_width = field_cfg.goal_inner_half_width + 0.3  # 1.3 m
+  goal_buffer = 0.6  # allow ~0.6 m of goalward over-run past the goal line.
+
+  # Step 1+2: real termination (no bootstrap) + goal-mouth corridor.
+  cfg.terminations["out_of_field_bounds"] = TerminationTermCfg(
+    func=mdp.out_of_field_bounds,
+    time_out=False,  # <-- THE FIX: failure, not a time-limit truncation.
+    params={
+      "half_length": field_cfg.half_length,
+      "half_width": field_cfg.half_width,
+      "margin": 0.3,
+      "goal_corridor_half_width": goal_corridor_half_width,
+      "goal_buffer": goal_buffer,
+    },
+  )
+
+  # Explicit one-shot cost so the policy first *feels* a price for crossing the
+  # line. Rewards are dt-scaled (~0.02 s/step), so weight*dt is the realized
+  # one-shot magnitude: weight 5.0 -> ~0.10. Start small per the research's
+  # "don't crush exploration" red line; raise only if OOB stays high.
+  cfg.rewards["out_of_bounds_penalty"] = RewardTermCfg(
+    func=mdp.out_of_bounds_penalty,
+    weight=-5.0,
+    params={"term_name": "out_of_field_bounds"},
+  )
+  return cfg
