@@ -1527,9 +1527,12 @@ def mos92_soccer_e2e_dualcam_ekf_kick_env_cfg(
     params={
       "sensor_name": "foot_ball_contact",
       "command_name": "dribble",
-      # Gate out gentle pushing: EXP14 stalled with ball_speed~0.39, so only reward
-      # goalward strikes above 0.6 m/s to push the policy from "nudge" to "kick".
-      "speed_threshold": 0.6,
+      # Gate out gentle pushing without starving the signal: EXP15 set this to 0.6
+      # but the policy couldn't yet kick that hard, so kick_impulse went ~0 and
+      # ball_speed FELL (0.39->0.34) — the sparse-reward cold-start trap. 0.3 sits
+      # just above the nudge speed (~0.2) so a slightly harder push already scores
+      # and the gradient pulls toward "kick", not silence.
+      "speed_threshold": 0.3,
     },
   )
   return cfg

@@ -23,6 +23,7 @@ Usage: MUJOCO_GL=egl uv run python scripts/spike_v4_e2e_ekf_kick.py [--smoke]
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 from dataclasses import asdict
@@ -120,15 +121,22 @@ def main() -> None:
     # that narrow distribution (the bottleneck both the research and EXP14's
     # ball_speed~0.39 plateau point to). Reset std_param to ~1.0 so the policy can
     # rediscover large leg swings; PPO anneals it back down as the kick skill forms.
+    # Reopen exploration: the EXP13 bootstrap inherits a COLLAPSED action std
+    # (std_param mean~0.75, min~0.44) from the conservative "walk + gentle approach"
+    # policy. PPO's Gaussian won't spontaneously re-explore "explosive kick" from
+    # that narrow distribution. EXP15 reset to 1.0 but that was too aggressive —
+    # fell_over doubled (0.05->0.13) and oscillated wildly. 0.85 is just above the
+    # inherited 0.75: reopens kick exploration without destabilizing the gait.
+    KICK_STD = 0.85
     with torch.no_grad():
       actor = runner.alg._raw_actor
       dist = getattr(actor, "distribution", None)
       if dist is not None and hasattr(dist, "std_param"):
-        dist.std_param.fill_(1.0)  # linear std
-        print("[INFO] reset action std_param -> 1.0 (reopen kick exploration)")
+        dist.std_param.fill_(KICK_STD)  # linear std
+        print(f"[INFO] reset action std_param -> {KICK_STD} (reopen kick exploration)")
       elif dist is not None and hasattr(dist, "log_std_param"):
-        dist.log_std_param.fill_(0.0)  # log std: log(1.0)=0
-        print("[INFO] reset action log_std_param -> 0.0 (reopen kick exploration)")
+        dist.log_std_param.fill_(math.log(KICK_STD))  # log std
+        print(f"[INFO] reset action log_std_param -> log({KICK_STD}) (reopen kick)")
       else:
         print("[WARN] no std param found to reset; exploration unchanged")
   else:

@@ -17,10 +17,12 @@ DIMENSIONS = {
   ],
   "踢球链 KICK-CHAIN (codex 命门)": [
     ("Metrics/dribble/goal_rate", "goal_rate", True),
+    ("Metrics/dribble/target_is_goal", "tgt_is_goal", True),
     ("Metrics/dribble/episode_success", "episode_success", True),
     ("Metrics/dribble/possession", "possession", True),
     ("Metrics/dribble/ball_path_length", "ball_path", True),
     ("Metrics/dribble/ball_speed", "ball_speed", True),
+    ("Metrics/dribble/ball_speed_peak", "ball_speed_peak", True),
     ("Metrics/dribble/ball_to_target_error", "ball_to_tgt_err", False),
     ("Metrics/dribble/ball_stuck_time", "ball_stuck_s", False),
     ("Metrics/dribble/robot_to_ball_error", "robot_to_ball", False),
@@ -69,6 +71,17 @@ def main(log, window=100):
         continue
       mean, median, lo, hi, n = s
       print(f"  {label:<20}{mean:>10.4f}{median:>10.4f}{lo:>9.3f}{hi:>9.3f}{n:>5}")
+  # True shooting rate: goals per goal-target episode. The global goal_rate is
+  # capped by goal_target_fraction (only goal-target episodes can score), so this
+  # divides goal_rate by the realized goal-target fraction for the real signal.
+  gr = stats(extract(log, "Metrics/dribble/goal_rate"), window)
+  tg = stats(extract(log, "Metrics/dribble/target_is_goal"), window)
+  if gr and tg and tg[0] > 1e-6:
+    subset = gr[0] / tg[0]
+    print(
+      f"\n  ★ 真实射门率 (goal_rate/target_is_goal) = "
+      f"{gr[0]:.4f}/{tg[0]:.4f} = {subset:.3f}  (球门子集进球率)"
+    )
 
 
 if __name__ == "__main__":
