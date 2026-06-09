@@ -46,3 +46,32 @@
 - 不做 B1 ball belief(oracle 阶段球位完美,推迟到真检测器阶段)。
 - 不做踢腿参考轨迹(先试 spawn+impulse 的纯 RL,不行再加 imitation)。
 - 不动线A EKF 代码。
+
+---
+
+## 训练中代码审查发现(2026-06-09,EXP14 跑到 ~1100 iter 时)
+用 subagent 审查新代码,发现 2 个真问题(EXP14 不中止,跑完作参考;EXP15 必修):
+
+### 问题1(中-高):near-foot 0.08m 下界从 root 量,球可能 spawn 进脚/腿几何
+- `near_foot_dist` 从 root_link(骨盆中心)量,非从脚量。球半径 0.11m,球心距根 0.08m 时
+  球面盖过骨盆中心落在双脚间 → reset 穿透 → 第一步冲量弹飞球 → (a)假踢奖励噪声 (b)球出界。
+- 注释引 codex"脚-球接触 0.09m"论证 0.08m,但那是**脚坐标系**,这里误用到**根坐标系**(脚趾本在根前~0.1m)。
+- **实测佐证**:out_of_bounds 从 EXP13 的 0.21 升到 0.368(球弹飞出界);
+  但 kick_impulse mean 仅 0.014 无尖峰,说明假踢奖励程度轻(多数球落 0.08-0.20 均匀分布,只少数极近穿透)。
+- **EXP15 修**:near_foot_dist 下界提到 ≥0.25m(容纳球半径+脚几何),或从脚 site 而非 root 量距离;修注释坐标系混淆。
+
+### 问题2(低-中):near_foot 与 rear_spawn 非互斥,分布混乱
+- ekf_kick 从 fused_scan(line 520)继承 rear_spawn_fraction=0.5(线A 扫视实验设的)。
+  near_foot=0.5 与 rear=0.5 同时开,代码里非互斥(theta 先被 rear 覆盖、后被 near_foot 覆盖),
+  near_foot 静默胜出 → 实际分布约 near 50% / rear 25% / 普通 25%,偏离设计意图。
+- **EXP15 修**:near-foot env 显式设 rear_spawn_fraction=0(踢球技能不需要后方搜索),
+  或改成互斥采样。
+
+### 次要(不改也可)
+- kick_impulse 与 goal_progress 在接触步双计(同向冗余,接触时刻过度加权,不退化只是低效)。
+- dribble_kick_contact(二值 w1.0)仍是真正可 farm 的"碰球刷分"向量,可考虑降权或改幅度加权。
+- 函数名 impulse 实际量的是接触步球速非 Δv,严格应奖 Δ(朝门球速)。
+
+### EXP14 结果的解读折扣
+goal_rate 0.105 仍 > EXP13 0.08(主目标真改善),但 out_of_bounds 升高说明分布有噪声污染。
+EXP15 修问题1+2 后,goal_rate 预期能更干净地上升。EXP14 作为"概念验证"有效,数字打折看。
