@@ -813,3 +813,22 @@ DeepMind "Learning Agile Soccer Skills"(arXiv:2304.13653):先训单技能专家(
 **结论**:这是真 bug 但严重度中低——不是 EXP8/9/10 扫视学不动的主因(那是间接奖励+点云拼接架构问题),
 但会给扫视学习加噪声。**修法**:reward 改为现场计算 uniq_frac(不读缓存),或 reset 时把 _last_uniq 清零。
 鉴于线A 要转向 EKF 重构,此 bug 留待重构时一并处理(EKF 版 reward 接口会重写),现在不单独热修。
+
+## EXP12 离线 EKF 验证:递归滤波大幅胜出(2026-06-09,决定性正面结果)
+线A R1 重构前的廉价 gate:同一 EXP11 策略 rollout(model_1500),同样的 per-landmark depth 观测,
+三方法公平对比 pos_err(EKF 从宽先验起步,非给 GT):
+| 方法 | mean | median |
+|---|---|---|
+| 单帧 Kabsch | 3.65m | 1.90m |
+| 8帧点云拼接 Kabsch(现架构)| 2.68m | 1.31m |
+| **递归 EKF** | **1.21m** | **1.10m** |
+**EKF vs 点云拼接 +55%,vs 单帧 +67%**。
+**结论(决定性)**:
+1. 调研论点在真实数据成立——递归滤波远胜几何配准。"被动融合无效"是点云拼接架构错,非融合本身无用。
+2. EKF 离线就把 mean 2.68→1.21m、median→1.10m,**已接近 1m 目标**(且用的是未为 EKF 优化的旧策略)。
+3. 点云拼接 mean(2.68)>>median(1.31)的长尾大误差,EKF 消除了(mean≈median)——长尾很可能是
+   镜像对称跳变,印证 R2 对称消歧价值。
+**纪律**:两步验证——① 合成自检(每帧仅见3/8点,EKF 30步收敛到0.0000m,证数学正确)
+② 真实 rollout 对比(本结果)。EKF 公式见 scripts/exp12_offline_ekf.py:_ekf_step。
+**下一步**:R1 把 FusedPoseBelief 重构为在线 EKF(用此验证过的 _ekf_step),重训看 pos_err 能否破 1m。
+踩坑:验证脚本须用训练时同一 env(fused_scan,obs 88维)才能加载策略;_collect_frame 前须 _ensure_init。
