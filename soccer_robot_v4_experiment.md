@@ -741,3 +741,19 @@ reset 只清被 reset 的 env 行,不动全局节奏。或最简:stride 逻辑�
 actor.ball_to_target 是 FusedPoseBelief(7维)。reward 查 term 用 isinstance 过滤,安全;但 critic
 看到的 belief 与 actor 不同(critic 用的是球向量而非融合位姿)——这是继承自 oracle env 的原有结构,
 非本次引入,但值得确认 critic 价值估计是否因此有偏。
+
+## 从 codex 实验借鉴的关键教训(2026-06-09,跨 agent 学习)
+查阅 mjlab_codex_v4 的 EXP7C8-C21 实验(codex 走无训练阶段机+手写搜索+GT override 诊断路线)。
+codex 还独立监督了我的 EXP8 训练,第三方判读与我一致:not_scored_frac≈1,"不能算纯视觉踢球成功"。
+**三条直接改变我下一步判断的教训**:
+1. **"会扫视/看见球" ≠ "会踢球"**(最重要)。codex C8/C18/C21 反复证明:可见性/持球率/搜索能力都能提升,
+   但 goal_rate 始终≈0,球几乎不动(path/step≈0.0001,stuck 19s)。**真瓶颈不是感知,是"把球从可见态
+   稳定输送到近脚窗口[x_b≈0.08-0.15m,|y_b|<0.1m]并推出"的踢球链**。→ 我一直盯 pos_err/uniq_frac,
+   但即使自定位完美,踢球链是断的,goal_rate 不会自己上来。
+2. **GT 作弊都救不动踢球链**(C21a):上帝视角在近脚窗口注入推球命令,goal 仅 0.018(上界 0.68)。
+   说明冻结的 04_e2e actor 无法把视觉链状态转成踢球动作,需专门训练/蒸馏 belief-to-window + contact primitive。
+3. **新增搜索/扫视行为会挤掉已学的踢球/稳定**(C8 射门链退化 ≈ 我 EXP10 的 neck 狂甩破坏步态,同源张力)。
+**codex 现成工具**:scripts/summarize_v4_plain_log.py(统计 goal_rate/fell_over/not_scored/selfloc/ball_path),
+scripts/probe_v4_contact_windows.py(近脚触球窗口诊断)。下次 eval 应借鉴其指标集,不只看 pos_err。
+**结论修正**:v4 真正的拦路虎是**踢球链(belief→近脚窗口→推球)**,自定位只是前置。我应在修完融合 bug、
+确认自定位能到 1m 后,把重心转向 codex 已诊断清楚的踢球链问题,而非继续在扫视上深挖。

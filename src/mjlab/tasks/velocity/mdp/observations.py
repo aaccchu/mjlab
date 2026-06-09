@@ -465,7 +465,6 @@ class FusedPoseBelief(ManagerTermBase):
     self._stride = stride
     self._buf: CircularBuffer | None = None
     self._last_step: int = -1
-    self._steps_since_append: int = 0
     # env is injected lazily (registered with env=None like StackedCameraRGB), so
     # defer all env-dependent state to the first __call__.
     self._kp_local = None
@@ -487,10 +486,12 @@ class FusedPoseBelief(ManagerTermBase):
   def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
     if self._buf is None:
       return
+    # Zero ONLY the buffer rows of the envs being reset. Do NOT touch the global
+    # append cadence (_last_step): it is keyed on common_step_counter divisibility
+    # now, and clearing it on partial resets is exactly what stalled the buffer
+    # before. The CircularBuffer.reset(batch_ids) clears just those env rows.
     batch_ids = None if isinstance(env_ids, slice) else env_ids
     self._buf.reset(batch_ids=batch_ids)
-    self._last_step = -1
-    self._steps_since_append = 0
 
   def _collect_frame(self, env: ManagerBasedRlEnv) -> torch.Tensor:
     """Current frame -> (B, K*3): per-keypoint [base_x, base_y, weight], plus the
@@ -545,12 +546,19 @@ class FusedPoseBelief(ManagerTermBase):
     if self._buf is None:
       self._buf = CircularBuffer(self._n, env.num_envs, env.device)
     step = int(env.common_step_counter)
-    if step != self._last_step or not self._buf.is_initialized:
-      if not self._buf.is_initialized or self._steps_since_append >= self._stride - 1:
+    # Append cadence keyed on the GLOBAL step counter's divisibility by stride, NOT
+    # a reset-clearable accumulator. Earlier the cadence used self._steps_since_append
+    # which reset() zeroed on every PARTIAL env reset; with hundreds of envs some env
+    # terminates almost every step, so the counter never reached stride-1 and the
+    # buffer stopped appending fresh frames (fusion silently degraded to ~single
+    # frame). Divisibility on common_step_counter is reset-independent, so the
+    # temporal window keeps rolling regardless of per-env resets.
+    if not self._buf.is_initialized:
+      self._buf.append(frame)
+      self._last_step = step
+    elif step != self._last_step:
+      if step % self._stride == 0:
         self._buf.append(frame)
-        self._steps_since_append = 0
-      else:
-        self._steps_since_append += 1
       self._last_step = step
     buf = self._buf.buffer  # (B, N, 3K+3) oldest->newest
     B, N, _ = buf.shape
