@@ -1508,7 +1508,18 @@ def mos92_soccer_e2e_dualcam_ekf_kick_env_cfg(
 
   dribble = cfg.commands["dribble"]
   dribble.near_foot_spawn_fraction = 0.5
-  dribble.near_foot_dist_range = (0.08, 0.20)
+  # near_foot_dist is measured from root_link (pelvis), NOT the foot. The toes sit
+  # ~0.10-0.13m in front of root and the ball radius is ~0.11m, so a center-to-root
+  # distance below ~0.23m would spawn the ball INSIDE the foot/shin geometry ->
+  # reset penetration -> the ball gets flung out on step 1 (false-kick reward noise +
+  # out-of-bounds). EXP14 used (0.08,0.20) and out_of_bounds rose 0.21->0.28. Lower
+  # bound raised to clear the foot; the window still starts the policy near the ball.
+  dribble.near_foot_dist_range = (0.25, 0.40)
+  # The EKF env inherits rear_spawn_fraction=0.5 from fused_scan (line-A scan
+  # training). The kick skill does not need rear-blind search, and rear/near-foot
+  # are not mutually exclusive in the sampler (near-foot silently wins on overlap,
+  # scrambling the intended distribution). Disable rear spawn for the kick env.
+  dribble.rear_spawn_fraction = 0.0
 
   cfg.rewards["kick_impulse"] = RewardTermCfg(
     func=mdp.dribble_kick_impulse,

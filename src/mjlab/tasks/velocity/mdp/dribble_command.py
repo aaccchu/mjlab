@@ -416,14 +416,18 @@ class DribbleCommandCfg(CommandTermCfg):
   ball_init_speed_range: tuple[float, float] = (0.0, 0.0)
 
   # --- Near-foot kick window (v4 line-B B2) ---
-  # Fraction of episodes that spawn the ball directly in the near-foot kick
-  # window (in front of the robot's heading, ~0.1m away) so the policy densely
-  # practices the "ball-at-foot -> kick goalward" skill it otherwise rarely
-  # reaches. codex C20a put real foot-ball contact at x_b~0.09m, |y_b|~0.025m;
-  # the default spawn_dist_range (>=0.6m) almost never starts there.
+  # Fraction of episodes that spawn the ball just in front of the robot's heading
+  # so the policy densely practices the "ball-at-foot -> kick goalward" skill it
+  # otherwise rarely reaches (default spawn_dist_range >=0.6m almost never starts
+  # there). NOTE: the distance below is measured from root_link (pelvis), NOT the
+  # foot. codex C20a's contact window (x_b~0.09m in the FOOT frame) is ~0.10-0.13m
+  # ahead of root, and the ball radius is ~0.11m, so the lower bound must clear the
+  # foot geometry (>=~0.23m center-to-root) or the ball spawns inside the foot/shin
+  # and gets flung out at reset. Callers set the safe range explicitly.
   near_foot_spawn_fraction: float = 0.0
-  # Ball distance from the robot when near-foot spawned (m).
-  near_foot_dist_range: tuple[float, float] = (0.08, 0.20)
+  # Ball distance from root_link when near-foot spawned (m); keep lower bound clear
+  # of the foot geometry (see note above).
+  near_foot_dist_range: tuple[float, float] = (0.25, 0.40)
   # Half-angle (rad) of the frontal sector the near-foot ball spawns into.
   near_foot_half_angle: float = 0.35  # ~20deg cone in front of the heading.
 
