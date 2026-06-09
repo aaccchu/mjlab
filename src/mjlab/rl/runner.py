@@ -29,6 +29,11 @@ class MjlabOnPolicyRunner(OnPolicyRunner):
         if train_cfg[key].get("rnn_type") is None:
           for opt in ("rnn_type", "rnn_hidden_dim", "rnn_num_layers"):
             train_cfg[key].pop(opt, None)
+    # Strip keypoint_cfg when unused so plain PPO (which doesn't accept it) loads;
+    # only KeypointAuxPPO consumes it (EXP5f). None -> plain PPO, dict -> aux PPO.
+    alg = train_cfg.get("algorithm", {})
+    if alg.get("keypoint_cfg") is None:
+      alg.pop("keypoint_cfg", None)
     super().__init__(env, train_cfg, log_dir, device)
 
   def export_policy_to_onnx(

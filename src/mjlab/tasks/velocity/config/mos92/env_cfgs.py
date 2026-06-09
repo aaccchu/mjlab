@@ -1263,3 +1263,189 @@ def mos92_soccer_e2e_dualcam_keypoint_env_cfg(
     concatenate_dim=0,
   )
   return cfg
+
+
+def mos92_soccer_e2e_dualcam_oracle_env_cfg(
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """v4 EXP6: GT-landmark ORACLE pose belief as obs — perception OUT of the trunk.
+
+  EXP5 paradigm finding: the actor is a single shared MLP trunk emitting both
+  joint_pos and the selfloc detection slice, so ANY perception learning signal
+  (reward OR supervised loss) backprops through the trunk and corrupts the gait
+  (fell_over climbed 1 -> 37 -> 52 with gradient strength). The fix is structural:
+  perception must not be an action of the control policy.
+
+  Here the geometry chain runs in an OBSERVATION (oracle_pose_belief): project the
+  known field keypoints with TRUE visibility (oracle = perfect detection, NOT
+  perfect pose), depth-lift, Kabsch vs map -> a pose belief [x,y,sin,cos] + quality
+  signals [visible_frac, residual]. The soccer policy CONSUMES this belief; it has
+  no selfloc action and no keypoint reward, so no perception gradient touches the
+  gait trunk. This is codex diagnosis step #1: prove the back-end (belief -> kick)
+  is viable under perfect detection, AND remove the fell_over pollution source.
+
+  Derives from the dualcam keypoint base for the same kicking inheritance, but
+  strips the keypoint head/reward and swaps the GT-pose obs slot for the belief.
+  """
+  cfg = mos92_soccer_e2e_dualcam_keypoint_env_cfg(play=play)
+
+  # 1. Remove the keypoint detection head (action) and its reward — perception is
+  #    no longer an action of the policy.
+  cfg.actions.pop("selfloc", None)
+  for k in ("keypoint_detection", "keypoint_pose_error"):
+    cfg.rewards.pop(k, None)
+  cfg.observations.pop("keypoint_label", None)
+
+  # 2. Swap the actor's pose slot (held under the "ball_to_target" key, currently
+  #    robot_field_pose GT) for the geometry-recovered ORACLE belief (6-dim).
+  cfg.observations["actor"].terms["ball_to_target"] = ObservationTermCfg(
+    func=mdp.oracle_pose_belief,
+    params={"command_name": "dribble", "sensor_name": "head_cam"},
+  )
+
+  # 3. Remove any curriculum that fades/masks that slot — the belief is not GT, so
+  #    there is nothing to fade out (it degrades naturally when keypoints aren't
+  #    visible, which is the honest signal).
+  for cur_key in list(cfg.curriculum.keys()):
+    cur = cfg.curriculum[cur_key]
+    names = getattr(cur, "params", {}).get("term_names", [])
+    if "ball_to_target" in names or cur_key == "selfloc_gt_mask":
+      cfg.curriculum.pop(cur_key, None)
+
+  # 4. Monitor (weight 0): log the belief's pose error vs GT so the run is readable
+  #    (oracle_pose_belief is an obs and logs nothing on its own).
+  cfg.rewards["oracle_pose_belief_error"] = RewardTermCfg(
+    func=mdp.oracle_pose_belief_error,
+    weight=1e-8,  # ~zero (term returns zeros) but NON-zero so the manager RUNS it:
+    # weight==0 terms are SKIPPED (reward_manager.py:122), which would suppress the
+    # selfloc_pos_err_m / belief_vis_frac geometry monitor.
+    params={"command_name": "dribble", "sensor_name": "head_cam"},
+  )
+
+  return cfg
+
+
+def mos92_soccer_e2e_dualcam_fused_scan_env_cfg(
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """v4 EXP8: TEMPORAL FUSION + ACTIVE NECK SCAN on top of the oracle belief.
+
+  EXP6 fixed the architecture (perception-as-obs, fell_over 52->0). EXP7 proved
+  single-frame belief is stuck at ~4/23 keypoints (pos_err ~4m) and passive
+  multi-frame fusion barely helps (unique coverage 3.9->4.4) because a forward-
+  walking robot keeps the SAME few keypoints in view. EXP8 offline analysis showed
+  the head cam rides the neck (neck_yaw +-90deg), and a neck sweep raises unique
+  coverage 5 -> 9-14; the FusedPoseBelief validation hit median 1.03m PASSIVELY.
+
+  This env unlocks the scan behavior:
+    1. swap the single-frame oracle belief for FusedPoseBelief (odometry-fused
+       N-frame window -> 7-dim belief incl. uniq_frac);
+    2. add active_scan_coverage reward (rewards raising uniq_frac toward 0.6, only
+       achievable by sweeping neck_yaw to new landmarks);
+    3. relax the neck pose-reward pull so the policy is free to sweep instead of
+       being dragged back to neck-centered.
+  Still oracle DETECTION (isolate the detector variable, per codex's stage order).
+  """
+  cfg = mos92_soccer_e2e_dualcam_oracle_env_cfg(play=play)
+
+  # 1. Swap single-frame belief -> temporally-fused belief (7-dim). Registered as
+  #    a stateful instance with env=None (lazily injected on first call, like
+  #    StackedCameraRGB).
+  cfg.observations["actor"].terms["ball_to_target"] = ObservationTermCfg(
+    func=mdp.FusedPoseBelief(
+      None,  # type: ignore[arg-type]  # env injected lazily on first call
+      command_name="dribble",
+      sensor_name="head_cam",
+      num_frames=8,
+      stride=4,
+    ),
+    params={
+      "command_name": "dribble",
+      "sensor_name": "head_cam",
+      "num_frames": 8,
+      "stride": 4,
+    },
+  )
+
+  # 2. Active-scan coverage reward (drives neck sweeping toward more unique kp).
+  cfg.rewards["active_scan"] = RewardTermCfg(
+    func=mdp.active_scan_coverage,
+    weight=0.5,
+    params={"command_name": "dribble", "sensor_name": "head_cam", "target_frac": 0.6},
+  )
+
+  # 3. Relax the neck pose-reward pull (was std 0.1/0.15 = strong centering) so the
+  #    policy can sweep neck_yaw freely. Larger std = weaker pull.
+  for key in ("std", "std_running"):
+    d = cfg.rewards["pose"].params.get(key)
+    if isinstance(d, dict):
+      for jk in list(d.keys()):
+        if "neck_yaw" in jk:
+          d[jk] = 1.5  # very weak centering on the scan joint
+
+  # 4. Replace the single-frame belief monitor with the FUSED-belief monitor so
+  #    Metrics/selfloc_pos_err_m reflects what the policy actually consumes.
+  cfg.rewards.pop("oracle_pose_belief_error", None)
+  cfg.rewards["fused_belief_error"] = RewardTermCfg(
+    func=mdp.fused_belief_error,
+    weight=1e-8,  # ~0 but non-zero so the manager runs the monitor.
+    params={"command_name": "dribble"},
+  )
+
+  return cfg
+
+
+def mos92_soccer_e2e_dualcam_gated_scan_env_cfg(
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """v4 EXP9: CERTAINTY-GATED active scan. EXP8 showed ball-staring (gaze_center
+  w=1.0) out-competes active_scan (0.5) for the single neck joint, so the policy
+  never sweeps (uniq_frac stalled ~0.24, pos_err stuck 1.8m from passive fusion
+  alone). Fix = time-share by belief certainty: gate the gaze (ball-staring)
+  rewards by uniq_frac so staring pays nothing while the belief is poor, making
+  scanning the only way to earn reward until coverage is good; then gaze reopens
+  for kicking. Also bump active_scan 0.5 -> 1.0 to strengthen the sweep gradient.
+  """
+  cfg = mos92_soccer_e2e_dualcam_fused_scan_env_cfg(play=play)
+
+  # Replace gaze rewards with certainty-gated versions (keep weights).
+  if "gaze_center" in cfg.rewards:
+    w = cfg.rewards["gaze_center"].weight
+    cfg.rewards["gaze_center"] = RewardTermCfg(
+      func=mdp.gaze_center_gated,
+      weight=w,
+      params={"command_name": "dribble", "std": 0.5, "certain_frac": 0.4},
+    )
+  if "gaze_search" in cfg.rewards:
+    w = cfg.rewards["gaze_search"].weight
+    cfg.rewards["gaze_search"] = RewardTermCfg(
+      func=mdp.gaze_search_gated,
+      weight=w,
+      params={"command_name": "dribble", "certain_frac": 0.4},
+    )
+
+  # Strengthen the scan gradient (0.5 -> 1.0) now that gaze no longer dominates.
+  if "active_scan" in cfg.rewards:
+    cfg.rewards["active_scan"].weight = 1.0
+
+  return cfg
+
+
+def mos92_soccer_e2e_dualcam_neck_motion_env_cfg(
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """v4 EXP10: DIRECT neck-motion reward. EXP9 proved the indirect coverage reward
+  (active_scan on uniq_frac) can't teach the neck to sweep even when it's the only
+  reward — the credit path turn->coverage->reward is too long. EXP10 adds a dense
+  reward DIRECTLY on |neck_yaw angular velocity|, gated to fire while the belief is
+  uncertain, so the policy first learns the sweep ACTION; the coverage/gaze rewards
+  then shape WHERE to look. Built on the EXP9 gated env (keeps gated gaze so staring
+  doesn't dominate once coverage is good)."""
+  cfg = mos92_soccer_e2e_dualcam_gated_scan_env_cfg(play=play)
+
+  cfg.rewards["neck_scan_motion"] = RewardTermCfg(
+    func=mdp.neck_scan_motion,
+    weight=0.8,
+    params={"command_name": "dribble", "certain_frac": 0.4, "vel_scale": 2.0},
+  )
+  return cfg

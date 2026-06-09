@@ -451,3 +451,69 @@ Claude 提出的关键约束成立:监督 loss 需要 per-sample 的投影标签
 - noisy-oracle 给出 detector 需要达到的 pixel/depth/ID 误差预算。
 - learned detector 失败时,必须和 oracle/noisy-oracle 对照定位原因。
 - 每个阶段都要写清是否生成 checkpoint/eval 工件,成功阶段应落到正式 `checkpoints/` 和 `soccer_eval/`。
+
+## 2026-06-08 20:35 EXP5f 当前训练审计:检测在学,但行为已崩
+
+### 检查对象
+
+- 活跃脚本:`scripts/spike_v4_e2e_keypoint.py`
+- run:`logs/rsl_rl/mos92_velocity/2026-06-08_20-15-03_spike_v4_e2e_keypoint`
+- 日志:`/tmp/v4_kp5f_full.log`
+- 状态:Python 训练进程已不在,日志停在 `Learning iteration 433/3800`,最新 checkpoint 到 `model_400.pt`。
+
+### 标签/GT 泄漏检查
+
+- `agent.yaml` 中 actor obs_groups 为 `actor/camera/camera_rgb`;critic 为 `critic`;`keypoint_label` 是单独 obs group。
+- RSL-RL `CNNModel/MLPModel` 会按 `obs_groups[obs_set]` 选择输入,不是拼所有 observation。
+- 因此当前未发现 `keypoint_label` 直接泄漏进 actor/critic 输入。
+- `keypoint_label` 进入 rollout storage 并由 `KeypointAuxPPO` 的 aux loss 使用,这符合 A' 设计。
+- 仍需注意:aux loss 当前对整个 actor 反传,会更新共享 RGB CNN、MLP trunk、运动输出相关参数,这可能破坏已学行为。
+
+### 当前趋势
+
+关键点监督信号确实在学:
+- `Loss/kp_aux`:约 `0.269 -> 0.096`
+- `Loss/kp_aux_pix_err`:约 `0.629 -> 0.331`
+- `Metrics/kp_pixel_err`:约 `1.57 -> 1.15`,中途最好约 `0.553`,后段反弹。
+
+但运动/踢球行为已经严重崩溃:
+- `Episode_Termination/fell_over`:约 `5.07 -> 52.75`
+- `Train/mean_episode_length`:约 `56 @ iter100 -> 7.36 @ iter435`
+- `Metrics/dribble/step_count`:约 `56 @ iter100 -> 7.32 @ iter435`
+- `Metrics/dribble/goal_rate`:全程 `0`
+- `Episode_Reward/dribble_success`:接近 `0`
+- `Metrics/kp_selfloc_pos_err_m`:约 `8.07 -> 5.73`,仍远不达标,且是在大量摔倒/短 episode 下得到的指标。
+
+### 主要漏洞/疑点
+
+1. **checkpoint 起点与目标不匹配**
+   脚本实际 `BASE_CKPT` 是 `checkpoints/v3_soccer_solo/01_selfloc_purevision/model_2800.pt`,不是用户对标的
+   `04_e2e_integrated/model_1499.pt`。这不利于保住 `04_e2e` 的踢球行为。
+
+2. **大量参数被重初始化**
+   日志显示 actor 只 loaded 15, reinit 10:
+   `obs_normalizer`、`distribution.std_param 24->66`、`mlp.0.weight`、`mlp.6.weight/bias`、`camera_rgb`
+   均重初始化。也就是说它不是在稳定 e2e 踢球策略上小修检测头,而是在大幅改 actor 输出结构后重训。
+
+3. **aux loss 可能冲坏共享运动策略**
+   `KeypointAuxPPO._train_keypoint_aux()` 使用 PPO optimizer 对 actor 全部参数 step。由于 selfloc 输出和 motor 输出共享 trunk,
+   `coef=1.0` 的监督更新可能直接改坏 locomotion/dribble 表征。
+
+4. **当前 run 不能继续作为有效主实验**
+   到 iter 300 后已经稳定进入短 episode/高摔倒区。即使关键点 loss 继续下降,也只是“摔倒数据分布上的检测学习”,
+   不能代表纯视觉踢球能力提升。
+
+5. **Claude 的监控命令可能误判运行状态**
+   发现 shell waiter 中用 `pgrep -f "spike_v4_e2e_keypoint.py"`,可能匹配到包含该字符串的监控脚本自身。
+   后续应匹配 `.venv/bin/python scripts/spike_v4_e2e_keypoint.py` 或直接检查训练 PID。
+
+### 给 Claude 的建议
+
+- 这次 run 应标记为失败/中止,不要等满 3800,也不要因为 `kp_aux` 下降而写成 EXP5f 成功。
+- 下一次先做 smoke/短 run 对照:
+  1. `aux_coef=0` 或禁用 aux loss,确认同样 keypoint env/66-d action/partial load 是否本身就摔。
+  2. `aux_coef` 从 `0.01/0.05/0.1` 递增,不要直接 `1.0`。
+  3. aux loss 先只更新 `camera_rgb` 和 selfloc/keypoint head,冻结或保护 motor trunk/已有 locomotion 参数。
+  4. 若目标是保住 04_e2e 行为,应从 `04_e2e_integrated/model_1499.pt` 或等价 e2e checkpoint 做更一致的迁移。
+  5. 每次短 run 必须同时看 `kp_aux/kp_pixel_err` 和 `fell_over/step_count/goal_rate/dribble_success`。
+- 若只想验证检测头可学,建议先用离线/rollout 数据训练 detector 或 oracle/noisy-oracle 路线,不要把完整运动策略一起暴露给大梯度。

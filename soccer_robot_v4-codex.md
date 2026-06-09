@@ -405,3 +405,31 @@ oracle/noisy-oracle 分层验证。它不是最终方案,而是训练和诊断�
 - noisy-oracle 阶段能给出误差预算:检测器需要达到怎样的 pixel/depth/ID 准确率才值得接入。
 - learned detector 接入后,若失败,要用 oracle 对照定位失败来源,不要盲目加复杂网络。
 - 端到端微调只能作为最后整合,不能替代模块级验收。
+
+## 15. 2026-06-08 20:35 监督结论:EXP5f A' 已及时停训,但必须正式记录失败原因
+
+Claude 自查并停止 `spike_v4_e2e_keypoint.py` 是正确动作。当前检查确认:
+- 真正的训练 Python 进程已停止,日志停在 `Learning iteration 433/3800`。
+- run 目录:`logs/rsl_rl/mos92_velocity/2026-06-08_20-15-03_spike_v4_e2e_keypoint`。
+- checkpoint 只到 `model_400.pt`。
+- 剩余的 `pgrep -f "spike_v4_e2e_keypoint.py"` waiter 是监控 shell,不是训练进程;这种写法会匹配到自身,
+  后续监控应匹配实际 Python PID 或 `.venv/bin/python scripts/...`。
+
+本次失败性质:
+- 未发现 `keypoint_label` 直接进入 actor/critic 输入。RSL-RL 模型按 `obs_groups["actor"]` 取
+  `actor/camera/camera_rgb`,标签只在 aux loss 使用。
+- 检测监督 loss 确实有效:`kp_aux` 和 `kp_aux_pix_err` 下降。
+- 但行为已崩:`fell_over` 升到约 `52`,episode/step_count 掉到约 `7`,goal_rate 全程 `0`。
+- 因此不能写成 EXP5f 成功,也不应继续跑满。它证明的是“当前 A' 实现会在共享 actor 上冲坏运动策略”。
+
+最可能漏洞:
+- `BASE_CKPT` 仍是 `01_selfloc_purevision/model_2800.pt`,不是用户对标的 `04_e2e_integrated/model_1499.pt`。
+- actor 大量参数重初始化,包括 `std_param 24->66`、`mlp.0`、`mlp.6`、RGB CNN、normalizer。
+- aux loss 用同一个 PPO optimizer 更新整个 actor,会改共享 trunk 和 motor 输出相关参数;`coef=1.0` 对运动策略过重。
+
+下一步给 Claude 的硬要求:
+- 把这次失败正式写进 `soccer_robot_v4_experiment.md`,不能只写在临时日志或自查口头结论里。
+- 下一轮必须先做短 run 消融:`aux_coef=0`、`0.01/0.05/0.1`,并同时看 `kp_aux/kp_pixel_err` 与
+  `fell_over/step_count/goal_rate/dribble_success`。
+- 优先保护运动策略:冻结或隔离 motor trunk/已有 locomotion 参数,让 aux loss 先只训 RGB/keypoint 检测相关参数。
+- 若目标是保住 `04_e2e` 行为,迁移起点应尽量从 `04_e2e_integrated/model_1499.pt` 或等价 e2e checkpoint 开始。

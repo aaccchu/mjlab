@@ -254,3 +254,57 @@ load 进 policy 的 RGB CNN+selfloc head → e2e 训练时冻结或低 lr 微调
 - 红线:标签随 rollout 对齐进 batch、不进 actor/critic 输入、不污染 pip 包、每步 smoke 验
   label shape + obs_groups 排除 + aux loss 下降。
 - C(在线 backward)放弃;B(离线预训练)留作 fallback。
+
+---
+
+## 九、EXP6 oracle-first:感知移出 actor trunk(2026-06-08,范式转向)
+
+### 根因(EXP5 系列的范式级结论)
+actor 是**单一共享 MLP trunk**(259→512→256→128→66),mlp.6 同层吐 joint_pos[0:20]+selfloc[20:66]。
+**任何感知学习信号(reward 或 supervised loss)都经共享 trunk 反传污染步态**——fell_over 随感知梯度强度
+单调恶化(EXP5d≈1→5e 37→5f 52)。"reward vs loss"是症状,**感知与控制共享网络主干**才是病根。
+
+### 架构翻转
+- **旧**:策略把关键点/位姿当 46-d action 预测(感知在 actor trunk 内,梯度污染步态)。
+- **新**:detector→几何 Kabsch→**位姿 belief**,belief 作为 **obs 喂给 soccer policy**。感知离开 trunk。
+
+### EXP6 = GT-landmark oracle(codex 诊断顺序 #1)
+**机制**:GT 3D 关键点→project→真实可见性→real depth 抬升→base 系→Kabsch→belief
+[x_n,y_n,sin_yaw,cos_yaw] + 质量信号[visible/K, kabsch 残差]→进 actor obs。
+- **不喂 GT robot pose**,只喂"GT 检测经几何链解出的 belief"(受真实可见性几何约束,合法 oracle)。
+- **三清除**:删 selfloc 动作头(actor 回 20 维纯运动)、删 keypoint_detection reward、回 plain PPO。
+- **一石二鸟**:① 验证后端(belief→主动扫视→踢球)在感知完美时是否可行;② oracle 供感知→
+  **零感知梯度穿过步态 trunk**→直接消除 fell_over 污染源。
+**判据**:oracle 下 pos_err<1m + goal_rate≥0.2 + fell_over≈0。达标→病在感知;仍崩→病在融合/动作/协调。
+**实现**:新 env builder(保留 keypoint env 对照)+ 新 spike 脚本 + belief-vs-GT monitor 验证几何正确。
+
+## 十、EXP6-9 执行结论:架构修复成功,瓶颈转为"主动扫视行为"(2026-06-08/09)
+
+### EXP6 结果:架构翻转验证成功(第九节方案)
+oracle belief 训练 3000 iter:**fell_over 52→0**(感知移出 trunk,步态零污染,病根确认是共享主干)。
+但 **pos_err 卡 4.2m、goal_rate≈0、belief_vis_frac≈0.17(~4/23 关键点)**。
+→ 架构对了,但暴露真瓶颈:**单帧前向窄视角看不到足够地标**,Kabsch 欠定。非后端不可行,是输入覆盖不足。
+
+### EXP7 离线诊断:被动时序融合无效(决定性洞察)
+对 EXP6 策略 rollout,对比单帧 vs 多帧 odometry 融合 Kabsch:
+pos_err 仅降 13%,**唯一关键点 3.9→4.4**(可见点堆到 43.5 全是同~4点的重复观测)。
+→ **被动融合无用**:机器人朝同方向走,视野永远那几个点。Kabsch 约束由唯一点决定,重复观测只降噪。
+**纯几何+sim 实测进一步钉死瓶颈**:深度全程有效(排除深度因素);几何允许单朝向看 9-12 点、
+全扫 yaw 覆盖 23,但实测固定朝向仅 ~5——**瓶颈是行为(策略不转头),非几何/深度/精度**。
+
+### EXP8:实现时序融合+扫视激励,但扫视未涌现(奖励冲突)
+实现 FusedPoseBelief(8帧/stride4 odometry 融合的有状态 obs)+ active_scan 奖励 + 放松 neck 回中。
+结果:**pos_err 4.2→1.8m**(几乎全来自被动融合,smoke 8 iter 已 1.81m),**scan_uniq_frac 卡 0.24 没升**。
+**根因**:`gaze_center`(weight 1.0,让 neck 盯球)碾压 `active_scan`(0.5)——单 neck 关节盯球与扫视
+物理互斥,策略选高奖励的盯球。这是奖励冲突,非架构问题。
+
+### EXP9:不确定性门控时间分工(进行中)
+修复=按 belief 确定度时间分工:gaze 奖励乘 clamp(uniq_frac/0.4) 门——belief 差时盯球不给分,
+扫视成唯一拿分路径;覆盖够了门开,盯球恢复为踢球。active_scan 权重 0.5→1.0。
+smoke 已证门控生效(gaze_center reward 被压到 0.0037 < active_scan 0.030)。全量训练判读中。
+
+### 认知主线(v4 至今)
+病根从"reward vs loss"→修正为"**感知与控制共享 trunk**"(EXP6 修复,fell_over 52→0)→
+再修正为"**单帧覆盖不足 + 策略不主动扫视**"(EXP7 诊断)→当前攻坚"**如何让 neck 扫视行为涌现**"
+(EXP8 奖励冲突→EXP9 门控)。**终极目标(pos_err<1m + 进球)尚未达成**,卡在主动视觉行为这一步。
+codex 红线仍守:oracle 检测隔离感知变量、安全课程先行、各阶段独立判据不被终局 goal_rate 掩盖。

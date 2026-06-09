@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 
 
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
+_NECK_YAW_CFG = SceneEntityCfg("robot", joint_names=("neck_yaw",))
 
 
 def track_linear_velocity(
@@ -1022,3 +1023,183 @@ def keypoint_pose_error(
   return torch.zeros(p_base.shape[0], device=env.device)
 
 
+
+
+def oracle_pose_belief_error(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  sensor_name: str = "head_cam",
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """v4 EXP6 MONITOR (weight 0): log the oracle belief's pose error vs GT.
+
+  oracle_pose_belief is an obs (no error logged), so this term runs the same
+  geometry and logs Metrics/selfloc_pos_err_m + belief_vis_frac so the full run is
+  readable. Returns zeros (no reward)."""
+  from mjlab.tasks.velocity.mdp.observations import (
+    oracle_pose_belief,
+    robot_field_pose,
+  )
+
+  belief = oracle_pose_belief(env, command_name, sensor_name, asset_cfg)  # (B,6)
+  gt = robot_field_pose(env, command_name, asset_cfg)  # (B,4)
+  command = _dribble_cmd(env, command_name)
+  dx = (belief[:, 0] - gt[:, 0]) * command.cfg.half_length
+  dy = (belief[:, 1] - gt[:, 1]) * command.cfg.half_width
+  pos_err = torch.sqrt(dx * dx + dy * dy)
+  env.extras["log"]["Metrics/selfloc_pos_err_m"] = pos_err.mean()
+  env.extras["log"]["Metrics/belief_vis_frac"] = belief[:, 4].mean()
+  return torch.zeros(belief.shape[0], device=env.device)
+
+
+def active_scan_coverage(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  sensor_name: str = "head_cam",
+  target_frac: float = 0.6,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """v4 EXP8: reward the fused belief's UNIQUE keypoint coverage (active scan).
+
+  EXP7/8 diagnosis: pos_err is bottlenecked by how many DISTINCT keypoints the
+  neck sweep brings into the fused window (uniq_frac), not by per-frame precision.
+  This rewards raising uniq_frac toward target_frac (~14/23), which the policy can
+  only achieve by actively sweeping neck_yaw to look at new landmarks. Saturates
+  at target so it doesn't fight kicking once coverage is sufficient.
+
+  Reads the cached uniq_frac the FusedPoseBelief term computed THIS step (it caches
+  to self._last_uniq on every __call__), so no geometry is recomputed and the
+  stateful frame buffer is not disturbed. Returns clamp(uniq_frac / target, 0, 1)."""
+  from mjlab.tasks.velocity.mdp.observations import FusedPoseBelief
+
+  om = env.observation_manager
+  term = None
+  # term instances live as cfg.func in the per-group cfg lists.
+  for grp in ("actor", "critic"):
+    names = om.active_terms.get(grp, [])
+    if "ball_to_target" in names:
+      idx = names.index("ball_to_target")
+      cand = om._group_obs_term_cfgs[grp][idx].func
+      if isinstance(cand, FusedPoseBelief):
+        term = cand
+        break
+  if term is None or term._last_uniq is None:
+    return torch.zeros(env.num_envs, device=env.device)
+  uniq = term._last_uniq
+  cov = torch.clamp(uniq / target_frac, 0.0, 1.0)
+  env.extras["log"]["Metrics/scan_uniq_frac"] = uniq.mean()
+  return cov
+
+
+def fused_belief_error(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """v4 EXP8 MONITOR (weight ~0): log the FUSED belief's pose error vs GT.
+
+  Reads the FusedPoseBelief term's cached belief xy (the SAME value the policy
+  consumes), so the logged Metrics/selfloc_pos_err_m reflects the fused (not
+  single-frame) belief. Returns zeros."""
+  from mjlab.tasks.velocity.mdp.observations import FusedPoseBelief, robot_field_pose
+
+  om = env.observation_manager
+  term = None
+  for grp in ("actor", "critic"):
+    names = om.active_terms.get(grp, [])
+    if "ball_to_target" in names:
+      cand = om._group_obs_term_cfgs[grp][names.index("ball_to_target")].func
+      if isinstance(cand, FusedPoseBelief):
+        term = cand
+        break
+  if term is None or term._last_xy_n is None:
+    return torch.zeros(env.num_envs, device=env.device)
+  gt = robot_field_pose(env, command_name, asset_cfg)  # (B,4)
+  command = _dribble_cmd(env, command_name)
+  dx = (term._last_xy_n[:, 0] - gt[:, 0]) * command.cfg.half_length
+  dy = (term._last_xy_n[:, 1] - gt[:, 1]) * command.cfg.half_width
+  pos_err = torch.sqrt(dx * dx + dy * dy)
+  env.extras["log"]["Metrics/selfloc_pos_err_m"] = pos_err.mean()
+  env.extras["log"]["Metrics/fused_uniq_frac"] = term._last_uniq.mean()
+  return torch.zeros(env.num_envs, device=env.device)
+
+
+def _fused_uniq_frac(env: ManagerBasedRlEnv) -> torch.Tensor | None:
+  """Read the FusedPoseBelief term's cached uniq_frac (None before first call)."""
+  from mjlab.tasks.velocity.mdp.observations import FusedPoseBelief
+
+  om = env.observation_manager
+  for grp in ("actor", "critic"):
+    names = om.active_terms.get(grp, [])
+    if "ball_to_target" in names:
+      cand = om._group_obs_term_cfgs[grp][names.index("ball_to_target")].func
+      if isinstance(cand, FusedPoseBelief):
+        return cand._last_uniq
+  return None
+
+
+def gaze_center_gated(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  std: float = 0.5,
+  certain_frac: float = 0.4,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """v4 EXP9: gaze_center GATED by belief certainty. EXP8 showed ball-staring
+  (gaze_center w=1.0) out-competes active_scan for the single neck joint, so the
+  policy never sweeps and uniq coverage stalls (~0.24). The fix is a time-share:
+  only reward ball-centering once the belief is already well-covered
+  (uniq_frac >= certain_frac). When the belief is poor the gate is ~0, so staring
+  pays nothing and scanning becomes the only way to earn reward; once coverage is
+  good the gate opens and the policy centers the ball to kick."""
+  base = gaze_center(env, command_name, std, asset_cfg)
+  uniq = _fused_uniq_frac(env)
+  if uniq is None:
+    return base
+  gate = torch.clamp(uniq / certain_frac, 0.0, 1.0)
+  return base * gate
+
+
+def gaze_search_gated(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  certain_frac: float = 0.4,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """v4 EXP9: gaze_search gated by belief certainty (same rationale as
+  gaze_center_gated). Turning toward the ball is only rewarded once self-loc
+  coverage is sufficient; while uncertain, active_scan drives the neck instead."""
+  base = gaze_search(env, command_name, asset_cfg)
+  uniq = _fused_uniq_frac(env)
+  if uniq is None:
+    return base
+  gate = torch.clamp(uniq / certain_frac, 0.0, 1.0)
+  return base * gate
+
+
+def neck_scan_motion(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  certain_frac: float = 0.4,
+  vel_scale: float = 2.0,
+  asset_cfg: SceneEntityCfg = _NECK_YAW_CFG,
+) -> torch.Tensor:
+  """v4 EXP10: DIRECTLY reward neck_yaw angular motion (not the coverage result).
+
+  EXP9 proved the indirect coverage reward (active_scan on uniq_frac) cannot teach
+  the neck to sweep — even when it's the only reward on offer, uniq_frac stayed
+  flat (~0.25). The credit-assignment path from "turn neck" -> "coverage rises" ->
+  "reward" is too long for PPO to discover. This gives a DIRECT, dense gradient on
+  the action itself: reward |neck_yaw angular velocity|, gated to fire only while
+  the belief is still uncertain (uniq_frac < certain_frac) so the head sweeps to
+  gather landmarks when lost and settles (to stare/kick) once well-localized.
+
+  reward = (1 - certainty_gate) * tanh(|neck_yaw_vel| / vel_scale), in [0,1)."""
+  asset = env.scene[asset_cfg.name]
+  neck_vel = asset.data.joint_vel[:, asset_cfg.joint_ids][:, 0]  # (B,)
+  motion = torch.tanh(neck_vel.abs() / vel_scale)
+  uniq = _fused_uniq_frac(env)
+  if uniq is None:
+    return motion
+  uncertain = 1.0 - torch.clamp(uniq / certain_frac, 0.0, 1.0)
+  return uncertain * motion

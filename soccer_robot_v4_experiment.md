@@ -532,3 +532,212 @@ PPO优化器,梯度流入共享CNN+检测头;④ class_name 点路径指向本�
 **早期(iter28)**:kp_aux 0.14、pix_err 0.47、pos_err 6.41m。ETA ~2.6h。
 **判据**:kp_aux_pix_err 持续降→kp_selfloc_pos_err_m<3m **且 fell_over/goal_rate 不退化**(监督loss不进奖励,
 不应再抢本体梯度——这是 A' 相对 EXP5e 的核心优势)。
+
+## EXP5f 判读 + 范式级根因(2026-06-08,决定全局)
+**EXP5f 被污染**:残留 EXP5e 的 keypoint_detection reward(weight2.5/std1.0)与新 aux loss 叠加,
+fell_over iter322 已 52(>EXP5e 37),非干净测试,已停。
+**但暴露范式级根因(网络结构已证)**:actor 是**单一共享 MLP trunk** 259→512→256→128→66,
+mlp.6 同层吐 joint_pos[0:20]+selfloc[20:66]。→ **任何感知学习信号(reward 或 supervised loss)都经共享
+trunk 反传污染步态**。这解释 fell_over 随感知梯度强度单调恶化(5d≈1→5e 37→5f 52)。
+**"reward vs loss"是症状,共享网络主干才是病根**。6 实验一直在和此耦合搏斗而未命名。
+
+## 范式转向:模块分离 + oracle 优先(采纳 codex 第13/14节)
+**架构必须翻转**:当前策略把关键点/位姿当 46-d action 预测(感知在 actor trunk 内);
+需改为 detector→几何/belief 估计器产出**位姿 belief**,belief 作为 **obs 喂给 soccer policy**(感知移出 trunk)。
+**EXP6 = GT-landmark oracle(codex #1,最高性价比首步)**:喂投影关键点+可见性(**不喂 robot pose**),
+Kabsch 出单帧 belief→belief 摘要进 policy obs。无 learned detector。
+- 一石二鸟:① 验证后端(Kabsch→belief→主动扫视→踢球)在"感知完美"时是否可行(codex 诊断顺序1);
+  ② oracle 供感知→**无感知梯度穿过步态 trunk**→直接消除 fell_over 污染源。
+- 判据:oracle 下 pos_err<1m + goal_rate≥0.2 + fell_over≈0。若仍不行→病在融合/动作/协调,不在 CNN。
+**后续阶梯**(codex):noisy-oracle 给误差预算→learned detector+frozen belief→+active perception→e2e 微调。
+**待用户定**:入口选 oracle-first(推荐),还是先建模块骨架,还是先离线验 belief。
+
+## EXP6 oracle 中期判读(iter ~1100/3000,2026-06-08)
+**结构性假设证实(本轮核心成果)**:感知移出 actor trunk(belief 作 obs、非 action)后,
+**fell_over 从 EXP5f 的 52 → 0.2~0.7**。步态污染根源(感知梯度穿共享 trunk)彻底消除。
+6 轮实验追的结构性病根已解。
+**但坐实真瓶颈(= codex #2/#3 预言)**:
+- selfloc_pos_err_m ≈ 4.5m(远差于静态校验的可见时 1.1m);belief_vis_frac 0.17(走动+前向窄视角
+  只见 ~4/23 关键点)→ Kabsch 欠定 → belief 误差大。
+- goal_rate 仍 0:belief 不准→无法定位瞄门。
+**结论**:单帧几何 + 窄视角不够。**必须上 ① 时序融合(EKF/MCL,跨帧累积关键点降低 vis 依赖)
++ ② 主动转身扩大视野**。这不是架构失败(fell_over 已证架构对),是 codex 分层路线的下一阶段入口。
+**下一步 EXP7**:在 belief obs 上叠加时序滤波(滑窗多帧关键点累积→Kabsch/EKF),先离线验 multi-frame
+pos_err < single-frame,再接训练。仍 oracle 检测(隔离检测器变量)。
+
+## EXP7 离线多帧融合 gate(2026-06-08,决定性洞察)
+对 EXP6 model_2999 rollout 120帧,对比单帧 vs 多帧(odometry 完美融合,窗口10)Kabsch:
+| | pos_err mean | median | 可见点 | **唯一关键点(满分23)** |
+|---|---|---|---|---|
+| 单帧 | 2.57m | 1.24m | 3.9 | **3.9** |
+| 多帧融合 | 2.23m | 1.06m | 43.5 | **4.4** |
+改善仅 13.4%。
+
+**决定性诊断**:10帧堆了43.5个观测,但**唯一关键点仅 3.9→4.4**——几乎全是同4个点的重复观测。
+Kabsch 几何约束由唯一点决定,重复观测只做降噪(13%≈降噪量级),不增新几何方向。
+
+**整个 v4 的决定性结论**:
+- **被动时序融合无效**:机器人朝同方向走,视野永远是那~4个点,唯一覆盖上不去。
+- **真正解锁点 = codex 主动视觉**:必须主动转身/扫视让相机指向不同关键点,唯一覆盖 4→15+,
+  Kabsch 才良态,pos_err 才可能破 1m。
+- 单帧 median 已 1.24m(好可见角度下接近1m),证明几何链本身对——缺的是**视野覆盖**,非精度。
+
+**下一步 EXP8 = 主动视觉(跳过被动时序,直击根因)**:在 belief obs(含 vis_frac/residual 不确定性)
+上,让策略学会"不确定时转身扫视"。codex 顺序:head scan→+body yaw→step-turn,奖励=唯一覆盖↑/
+不确定性↓,惩罚 fell_over/丢球/jerk,安全课程先行。oracle 检测仍保留(隔离检测器变量)。
+
+## EXP8 可行性上界诊断(2026-06-08,纯几何+sim 实测,确立 EXP8 价值)
+追查 EXP7 矛盾"为何单帧只见~4点"。三步诊断:
+1. **真实 project_keypoints CPU 扫 yaw**(含真实相机 mount quat):静止单朝向画面内 9-12 点(最佳朝向),
+   全扫 yaw unique **22-23/23**。几何上界充足。
+2. **sim 实测固定朝向**:画面内仅 **4.98 点**(策略追球,朝向几乎不变,只切到前向一片)。
+3. **深度有效性排除**:画面内点深度 100% 有效(range 1.58-15.21m,median 6.58m,无一被 30m 掩码或
+   3m cutoff 截断——cutoff 只作用 RGB-keypoint env 的 obs,不影响 belief 几何链)。
+
+**完整证据链(EXP8 主动视觉价值确立)**:
+① 几何允许全扫覆盖 23(上界足)② 深度全程有效(转到即可用)③ 当前策略不转身→卡 ~5 点→
+Kabsch 欠定→pos_err 4.2m。→ **转身把 unique 5→20+ 是解锁 <1m 的真实且唯一路径**。
+**EXP8 = 主动视觉确定值得做**(非被动时序)。瓶颈是行为(不转身),非几何/深度/精度。
+
+**EXP8 设计**:belief obs 已含 vis_frac/residual 不确定性。加主动转身能力 + 不确定性驱动奖励
+(unique 覆盖↑ / residual↓),安全课程先行(codex 红线:全身运动勿一次性放进踢球奖励)。
+仍 oracle 检测(隔离检测器变量)。先想清动作空间:复用现有关节(neck/base yaw)还是加显式扫视动作。
+
+## EXP8 动作空间核查 + neck 扫视上界(2026-06-08,确立分阶段设计)
+**关键事实**:head cam 挂 robot/head,body 链 base→neck(neck_yaw±90°)→head(neck_pitch±0.5)→cam,
+相机随 neck 转;neck_yaw/pitch 已在 actuator 动作空间内(无需加新动作)。
+**真实投影测 neck-only 扫视 unique 覆盖**(body 朝+x 典型追球朝向):
+| 位置 | neck中位(fixed) | neck±90°扫视 | 全身360° |
+|---|---|---|---|
+| (5,0) | 5 | 9 | 23 |
+| (7,3) | 3 | 9 | 23 |
+| (3,-5) | 4 | 11 | 23 |
+| (-3,-4) | 7 | 14 | 23 |
+neck 中位 3-8 ≈ sim 实测~5(模型验证)。
+
+**EXP8 分阶段设计(契合 codex 红线 head→body→step 渐进)**:
+- **阶段1 neck-only 主动扫视(最安全,优先)**:neck±90° 把 unique 5→9-14,**不动脚/不碰步态/不打断踢球**。
+  可能已足够 Kabsch 破 1m。零步态风险。
+- **阶段2**(若 neck 不够):加 body yaw 慢转,需安全课程(勿一次性放进踢球奖励)。
+**分水岭**:先验证 neck-only 9-14 unique 够不够破 1m;够则 EXP8 全程不需危险全身动作。
+**机制**:neck 已可控,EXP8 = 不确定性(vis_frac/residual)驱动的扫视激励 + 当前 pose reward 对 neck 的
+回中拉力需放松(否则 neck 被拉回中位不扫视)。oracle 检测仍保留。
+
+## EXP8 FusedPoseBelief obs 验证(2026-06-08,融合机制确认对)
+实现有状态时序融合 belief obs（FusedPoseBelief,仿 StackedCameraRGB 的 CircularBuffer+reset 范式）:
+N=8帧/stride=4(跨~0.64s),odometry 把各帧关键点累积到当前 base 帧→Kabsch,输出7维
+[x,y,sin,cos,vis_now,uniq_frac,resid]。用 EXP6 model_2999 rollout 150帧验证:
+| | pos_err mean | median | 覆盖 |
+|---|---|---|---|
+| 单帧 belief | 3.07m | 1.44m | vis_frac 0.177(~4点) |
+| 融合 belief | 2.17m | **1.03m** | uniq_frac 0.230(~5.3点) |
+改善 29.3%(median 1.44→1.03,已接近1m)。比离线脚本13%更好(stride=4 时间基线更长)。
+
+**结论**:融合机制几何正确、有状态缓冲/reset 正常。被动行走下已 median 1.03m。但 uniq_frac 仅0.23——
+因 EXP6 策略不主动扫视。**EXP8 训练解锁点**:策略学会 neck 扫视→uniq_frac 应冲 0.6+(13-14点)→
+pos_err 大幅破1m。因果链闭合:融合对,缺主动扫视行为。
+**EXP8 = FusedPoseBelief obs(就绪)+ neck 扫视激励 + 放松 neck 回中拉力**。
+
+## EXP8 全量训练启动(2026-06-08 夜,主动扫视+时序融合)
+实现并验证全部接线后启动:`scripts/spike_v4_e2e_fused_scan.py`,2000 iter,384 envs,
+从 EXP6 model_2999 bootstrap。env=`mos92_soccer_e2e_dualcam_fused_scan_env_cfg`。
+组件(均经 smoke 验证无误):
+- FusedPoseBelief obs(8帧/stride4 odometry 融合,7维,actor obs 87→88)
+- active_scan_coverage reward(weight 0.5,驱动 uniq_frac→0.6,只能靠转 neck 达成)
+- neck_yaw pose std 0.15→1.5(放松回中,允许扫视)
+- fused_belief_error 监控(weight 1e-8,记录融合 belief 真实 pos_err + fused_uniq_frac)
+smoke 8 iter 已见 pos_err 4.2→1.81m。**判读三判据**:① scan_uniq_frac 是否升>0.4(学会扫视)
+② selfloc_pos_err_m 是否破<2m 趋向1m ③ fell_over~0 且 goal_rate 不崩(扫视不吃稳定/踢球,codex红线)。
+等待器 bndxy1o3a 挂着。日志 /tmp/v4_exp8_full.log。
+**关键实现细节**:有状态 obs term 注册传实例 func=mdp.FusedPoseBelief(None,...)(env 惰性注入),
+仿 StackedCameraRGB;reward 经 om._group_obs_term_cfgs[grp][idx].func 拿 term 实例读缓存,不重算几何。
+
+## EXP8 结果 + 根因(2026-06-08 夜)
+2000 iter 完成。三判据:
+- ③ fell_over ~0.1 ✅(扫视没破坏步态)
+- ② selfloc_pos_err_m(融合)4.2→**1.8m** 🟡(大幅改善但卡 1.8m,未破 1m)
+- ① **scan_uniq_frac ~0.24 平,没升 ❌**(策略没学会主动扫视)
+- goal_rate 偶发 0.05-0.11 🟡
+pos_err 降到 1.8 几乎全来自**被动融合**(smoke 第8 iter 已 1.81m),主动扫视行为未涌现。
+
+**根因(确凿)**:`gaze_center`(weight **1.0**,让 neck 对准球保持球在画面中心)+ `gaze_search`(0.5,
+球不可见时转向球)与 `active_scan`(0.5,扫场地找地标)**争夺同一个 neck 关节**。单 neck 盯球与扫视
+物理互斥,盯球奖励(1.0+0.5)碾压扫视(0.5)→ 策略选盯球,neck 不扫,uniq 卡 0.24。
+证据:Reward/gaze_search 0.276 > active_scan 0.178。
+
+**这是奖励冲突,非架构问题**。解法=codex 预见的**不确定性门控时间分工**:belief 差→扫视找地标
+(压制 gaze);belief 好/将踢球→盯球。**EXP9 设计**:① gaze_center/search 按 belief 确定性门控
+(uniq_frac 高才奖励盯球)② active_scan 仅 belief 不确定时强激励 ③ 二者时间互补而非同时竞争。
+
+## EXP9 启动(2026-06-09,不确定性门控扫视)
+针对 EXP8 根因(盯球奖励碾压扫视)的修复:`scripts/spike_v4_e2e_gated_scan.py`,2000 iter,
+384 envs,从 EXP8 model_1999 bootstrap(同7维 belief,全载无 reinit)。
+env=`mos92_soccer_e2e_dualcam_gated_scan_env_cfg`。改动:
+- gaze_center/search → gated 版(乘 clamp(uniq_frac/0.4) 门:belief 差时盯球不给分)
+- active_scan weight 0.5→1.0(强化扫视梯度)
+smoke 验证门控生效:gaze_center reward 0.0037(被门压到~0)< active_scan 0.030,扫视首次主导。
+**判据**:① scan_uniq_frac 是否升>0.4(门控解锁扫视)② pos_err 是否随之破<1.5m 趋1m
+③ fell_over~0 且 goal_rate 不崩(门开后盯球恢复,能踢球)。
+等待器 bbghb4r4k。日志 /tmp/v4_exp9_full.log。
+若 EXP9 仍不扫视→说明 active_scan 奖励本身梯度不足/uniq_frac 对 neck 动作不敏感,需重审扫视激励
+设计(可能要直接奖励 neck_yaw 的运动幅度/方差,而非间接奖励覆盖结果)。
+
+## EXP9 结果:门控成功但扫视仍未涌现(2026-06-09,决定性负结论)
+2000 iter 完成。三判据:
+- ③ fell_over ~0.05-0.1 ✅(门控没破坏步态)
+- ② pos_err ~1.6m(偶达1.24)🟡(与 EXP8 持平,无突破)
+- ① **scan_uniq_frac 全程卡 0.25-0.28，纹丝不动 ❌**
+- goal_rate 偶发 0.06-0.25 不稳定 🟡
+**奖励分解证明门控机制本身成功**:gaze_center 被压到 0.03(EXP8 时主导)、active_scan 升到 0.43 主导。
+
+**决定性负结论**:即使扫视成为唯一高额奖励来源,策略依然学不会转 neck。
+→ 排除"奖励冲突"假说(EXP8 诊断)。真问题:**active_scan 间接奖励"覆盖结果"(uniq_frac),
+梯度传不到"转 neck_yaw"这个动作**。策略拿到 0.43 scan 奖励是被动行走的偶然覆盖,
+未建立"主动转头→覆盖↑→奖励↑"的因果关联。与"RL 教不动稠密视觉检测"同类问题(间接奖励教不动低层行为)。
+
+## EXP10 设计:直接奖励 neck 运动(绕过间接覆盖奖励)
+不再奖励覆盖结果,改**直接奖励 neck_yaw 的运动幅度/方差**(逼策略先动起来,建立动作-效果关联),
+belief 不确定时尤其激励。可能配合:① 奖励 neck_yaw 角速度绝对值(不确定时)② 或对 neck_yaw 加
+探索噪声/课程,先强制扫视再让覆盖奖励接管。仍 oracle 检测。从 EXP9 model_1999 bootstrap。
+
+## EXP10 启动(2026-06-09,直接奖励 neck 运动)
+针对 EXP9 负结论(间接覆盖奖励教不动扫视动作):`scripts/spike_v4_e2e_neck_motion.py`,2000 iter,
+384 envs,从 EXP9 model_1999 bootstrap。env=`mos92_soccer_e2e_dualcam_neck_motion_env_cfg`。
+核心新增:`neck_scan_motion` reward(weight 0.8)=(1-确定度门)*tanh(|neck_yaw角速度|/2.0)——
+**直接奖励 neck 转动动作本身**(belief 不确定时),给 PPO 短 credit path 的稠密梯度;覆盖/gaze 奖励
+负责塑造"往哪看"。保留 EXP9 门控 gaze + active_scan。
+**判据**:① neck_scan_motion 是否真驱动 neck 动起来 → scan_uniq_frac 是否首次升破 0.4
+② pos_err 是否随之破 1m ③ fell_over~0 且 goal_rate 不崩。
+**关键早期信号**(~iter 100-300 即可见):scan_uniq_frac 若开始爬升=动作涌现,路径打通;
+若仍卡 0.25=连直接运动奖励都教不动,需重审(可能 neck 动作被其他约束锁死/动作空间问题)。
+日志 /tmp/v4_exp10_full.log。
+
+## EXP10 中期观察(iter ~157,2026-06-09,直接运动奖励有效但引发稳定性张力)
+**关键突破信号**:直接奖励 neck 角速度**确实教会了 neck 动**——neck_scan_motion reward 0.005→0.23 持续爬升,
+scan_uniq_frac 多次冲到 **0.42**(EXP8/9 两轮死卡 0.25,首次实质突破)。证明"间接覆盖奖励教不动、
+直接动作奖励教得动"的判断正确。
+**代价(codex 红线预警的稳定性张力)**:初期 neck 狂甩→fell_over 飙到 **5.17**(灾难级),uniq 因频繁摔崩到 0.001。
+**但 PPO 正自行化解**:fell_over 单调恢复 5.17→3.6→2.0→1.0→0.5→0.27,已基本稳住;uniq 恢复到 ~0.27 并多次破 0.4。
+→ "边扫边稳"正在被 RL 学会。趋势向好,继续跑完 2000 iter 判读。
+**注意**:之前一次 task-notification 是误报(等待器被误打包进落盘命令导致 orphan,EXP10 实际未停);
+已重挂独立等待器 b7yhxvm9r。教训:run_in_background 的等待器不要和其他命令打包。
+
+## 代码审查发现(2026-06-09,EXP10 训练期间审查 FusedPoseBelief)
+**BUG #1(重要,影响 EXP8/9/10 的融合质量)**:FusedPoseBelief 的 append 节流用**全局标量**
+_last_step/_steps_since_append,但 reset() 在**每次部分 reset**(terminated 子集)时把它们清零。
+384 envs 下几乎每步都有 env 终止→计数器几乎每步被清零→steps_since_append 永远到不了 stride-1→
+**缓冲在初帧后基本停止 append 新帧,时序窗口变陈旧**。纯 Python 模拟证实:200 步 stride=4,
+若每步都有 env reset,实际 append 仅 **1 次**(健康应 ~50 次)。
+→ 后果:EXP8/9/10 的"8帧融合"实际退化成近似单帧(被动融合增益被悄悄抹掉)。这解释了为何
+EXP8 融合改善有限(1.8m)、EXP10 uniq_frac 卡 0.30——融合窗口根本没正常滚动。
+**注**:EXP8 离线验证脚本(median 1.03m)用独立 fused.reset(slice(None)) 全量 reset,不触发此 bug,
+所以验证时融合是健康的——这正是验证(1.03m)与训练(1.8m)差距的一个嫌疑根因。
+**StackedCameraRGB 同模式**:realspec 用 stride=6 也中招;默认 stride=1 的实例免疫(每步必 append)。
+**修复方向**:append 节流应 per-env(用 buffer 的 _num_pushes 或 per-env step 计数),
+reset 只清被 reset 的 env 行,不动全局节奏。或最简:stride 逻辑改为基于 env.common_step_counter
+的全局整除(step % stride == 0)而非易被 reset 清零的累加器。
+
+**BUG #2(非 bug,但需记录的设计不对称)**:critic.ball_to_target 仍是单帧 ball_to_target 向量,
+actor.ball_to_target 是 FusedPoseBelief(7维)。reward 查 term 用 isinstance 过滤,安全;但 critic
+看到的 belief 与 actor 不同(critic 用的是球向量而非融合位姿)——这是继承自 oracle env 的原有结构,
+非本次引入,但值得确认 critic 价值估计是否因此有偏。

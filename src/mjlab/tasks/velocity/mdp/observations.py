@@ -324,3 +324,283 @@ def keypoint_uv_label(
   uv = uv * vis_f.unsqueeze(-1)
   b, k = vis.shape
   return torch.cat([uv.reshape(b, k * 2), vis_f], dim=-1)  # (B, K*3)
+
+
+def oracle_pose_belief(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  sensor_name: str = "head_cam",
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """v4 EXP6: GT-landmark ORACLE pose belief as an OBSERVATION (B, 6).
+
+  The architectural flip vs EXP5: perception NO LONGER lives in the actor trunk as
+  a 46-d action. Instead the geometry chain runs HERE and feeds the soccer policy a
+  pose belief it consumes. Chain: project the known 3D field keypoints with TRUE
+  visibility (the oracle — perfect DETECTION, not perfect pose), sample real metric
+  depth at each visible pixel, lift to base frame (kinematic, no world pose), Kabsch
+  vs the known map -> recovered (x, y, yaw). Output:
+    [x_n, y_n, sin_yaw, cos_yaw, visible_frac, kabsch_residual]
+  matching robot_field_pose's encoding so the policy sees a familiar pose, PLUS two
+  belief-quality signals (how many points were visible, how well Kabsch fit) that a
+  later active-perception policy can gate scanning on.
+
+  Oracle boundary (codex red line): the policy never eats GT robot pose — only the
+  belief that GEOMETRY recovers from GT detections, which degrades naturally when
+  too few keypoints are visible. That degradation is the motivation for active
+  turning. No perception gradient flows through the gait trunk (this is an obs, not
+  an action), so it cannot corrupt locomotion.
+  """
+  from mjlab.tasks.velocity.mdp.field_keypoints import (
+    field_keypoints_3d,
+    project_keypoints,
+  )
+
+  cam = env.scene[sensor_name]
+  W, H = cam.cfg.width, cam.cfg.height
+  fovy = cam.cfg.fovy if cam.cfg.fovy is not None else 45.0
+  cam_idx = cam.camera_idx
+  sd = env.sim.data
+  cam_pos = sd.cam_xpos[:, cam_idx, :]
+  cam_mat = sd.cam_xmat[:, cam_idx, :].reshape(-1, 3, 3)
+  origin = env.scene.env_origins
+  kp_local = field_keypoints_3d(env.device)
+  kp_world = kp_local.unsqueeze(0) + origin.unsqueeze(1)
+  uv, vis = project_keypoints(kp_world, cam_pos, cam_mat, fovy, W, H)  # (B,K,2),(B,K)
+  return _belief_from_uv(env, uv, vis, cam, command_name, asset_cfg, kp_local)
+
+
+def _belief_from_uv(
+  env: ManagerBasedRlEnv,
+  uv: torch.Tensor,
+  vis: torch.Tensor,
+  cam,
+  command_name: str,
+  asset_cfg: SceneEntityCfg,
+  kp_local: torch.Tensor,
+) -> torch.Tensor:
+  """Shared geometry: (uv, vis) -> Kabsch pose belief (B, 6). Reused by oracle and
+  (later) the learned detector. uv normalized [-1,1], vis (B,K) float/bool mask."""
+  from mjlab.tasks.velocity.mdp.field_keypoints import (
+    kabsch_se2,
+    lift_pixels_to_world,
+  )
+  from mjlab.utils.lab_api.math import matrix_from_quat
+
+  W, H = cam.cfg.width, cam.cfg.height
+  fovy = cam.cfg.fovy if cam.cfg.fovy is not None else 45.0
+  cam_idx = cam.camera_idx
+  sd = env.sim.data
+  cam_pos = sd.cam_xpos[:, cam_idx, :]
+  cam_mat = sd.cam_xmat[:, cam_idx, :].reshape(-1, 3, 3)
+  K = kp_local.shape[0]
+  vis_f = vis.float()
+
+  # Sample raw metric depth at each pixel (nearest).
+  depth_raw = cam.data.depth  # (B, H, W, 1) meters
+  u_pix = ((uv[..., 0] + 1.0) * 0.5 * (W - 1)).round().long().clamp(0, W - 1)
+  v_pix = ((uv[..., 1] + 1.0) * 0.5 * (H - 1)).round().long().clamp(0, H - 1)
+  bidx = torch.arange(uv.shape[0], device=env.device).unsqueeze(1).expand(-1, K)
+  depth_at = depth_raw[bidx, v_pix, u_pix, 0]  # (B, K)
+
+  pw = lift_pixels_to_world(uv, depth_at, cam_pos, cam_mat, fovy, W, H)
+  robot: Entity = env.scene[asset_cfg.name]
+  base_pos = robot.data.root_link_pos_w
+  base_mat = matrix_from_quat(robot.data.root_link_quat_w)
+  rel = pw - base_pos.unsqueeze(1)
+  p_base = torch.einsum("bij,bkj->bki", base_mat.transpose(1, 2), rel)
+
+  w = vis_f * ((depth_at > 0.05) & (depth_at < 30.0)).float()  # (B,K)
+  map_xy = kp_local[..., :2].unsqueeze(0).expand(p_base.shape[0], -1, -1)
+  yaw_r, t_r = kabsch_se2(p_base[..., :2], map_xy, w)
+
+  command = _dribble_cmd(env, command_name)
+  x_n = t_r[:, 0] / command.cfg.half_length
+  y_n = t_r[:, 1] / command.cfg.half_width
+  # Kabsch residual (mean weighted reprojection error in field meters); high when
+  # few/degenerate points -> the belief is unreliable and scanning is warranted.
+  cos, sin = torch.cos(yaw_r), torch.sin(yaw_r)
+  Rx = cos.unsqueeze(1) * p_base[..., 0] - sin.unsqueeze(1) * p_base[..., 1]
+  Ry = sin.unsqueeze(1) * p_base[..., 0] + cos.unsqueeze(1) * p_base[..., 1]
+  pred_map = torch.stack([Rx + t_r[:, 0:1], Ry + t_r[:, 1:2]], dim=-1)
+  resid = (torch.linalg.norm(pred_map - map_xy, dim=-1) * w).sum(1) / w.sum(1).clamp(min=1.0)
+  vis_frac = w.sum(1) / float(K)
+  return torch.stack([x_n, y_n, sin, cos, vis_frac, resid], dim=-1)  # (B, 6)
+
+
+class FusedPoseBelief(ManagerTermBase):
+  """v4 EXP8: TEMPORALLY-FUSED oracle pose belief -> (B, 7).
+
+  EXP7 proved single-frame belief is stuck at ~4/23 visible keypoints (Kabsch
+  underdetermined -> ~4m). EXP6+EXP7 diagnosis: the fix is active neck scanning
+  (neck_yaw +-90deg raises coverage 5 -> 9-14) FUSED across frames via odometry so
+  the scan's different views accumulate into one well-conditioned solve.
+
+  Stateful term (mirrors StackedCameraRGB): a per-env CircularBuffer stores, for
+  each of the last N appended frames, the visible keypoints in THAT frame's base
+  frame plus that frame's world base pose (x, y, yaw). On call, every stored
+  frame's keypoints are transformed via odometry into the CURRENT base frame,
+  pooled, and Kabsch-fit against the known map. Output:
+    [x_n, y_n, sin_yaw, cos_yaw, vis_frac_now, uniq_frac_fused, residual]
+  uniq_frac_fused (distinct keypoints seen across the window) is the active-scan
+  signal: it rises only when the neck sweep brings NEW landmarks into view.
+
+  stride lets the N frames span a ~1-2s scan window (a single control step is too
+  short to cover a head sweep). Odometry here is GT base pose (oracle); codex's
+  noisy-oracle stage adds odometry noise later.
+  """
+
+  def __init__(
+    self,
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    sensor_name: str = "head_cam",
+    num_frames: int = 8,
+    stride: int = 4,
+  ):
+    super().__init__(env)
+    self._cmd = command_name
+    self._sensor = sensor_name
+    self._n = num_frames
+    self._stride = stride
+    self._buf: CircularBuffer | None = None
+    self._last_step: int = -1
+    self._steps_since_append: int = 0
+    # env is injected lazily (registered with env=None like StackedCameraRGB), so
+    # defer all env-dependent state to the first __call__.
+    self._kp_local = None
+    self._K = 0
+    self._last_uniq = None
+    self._last_resid = None
+    self._last_xy_n = None
+
+  def _ensure_init(self, env: ManagerBasedRlEnv) -> None:
+    if self._kp_local is not None:
+      return
+    from mjlab.tasks.velocity.mdp.field_keypoints import field_keypoints_3d
+
+    self._kp_local = field_keypoints_3d(env.device)
+    self._K = self._kp_local.shape[0]
+    self._last_uniq = torch.zeros(env.num_envs, device=env.device)
+    self._last_resid = torch.zeros(env.num_envs, device=env.device)
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    if self._buf is None:
+      return
+    batch_ids = None if isinstance(env_ids, slice) else env_ids
+    self._buf.reset(batch_ids=batch_ids)
+    self._last_step = -1
+    self._steps_since_append = 0
+
+  def _collect_frame(self, env: ManagerBasedRlEnv) -> torch.Tensor:
+    """Current frame -> (B, K*3): per-keypoint [base_x, base_y, weight], plus the
+    base pose is appended separately. Packs keypoints + pose into one tensor for
+    the CircularBuffer: (B, K*3 + 3)."""
+    from mjlab.tasks.velocity.mdp.field_keypoints import project_keypoints
+    from mjlab.utils.lab_api.math import matrix_from_quat
+
+    cam = env.scene[self._sensor]
+    W, H = cam.cfg.width, cam.cfg.height
+    fovy = cam.cfg.fovy if cam.cfg.fovy is not None else 45.0
+    cam_idx = cam.camera_idx
+    sd = env.sim.data
+    cam_pos = sd.cam_xpos[:, cam_idx, :]
+    cam_mat = sd.cam_xmat[:, cam_idx, :].reshape(-1, 3, 3)
+    origin = env.scene.env_origins
+    kp_world = self._kp_local.unsqueeze(0) + origin.unsqueeze(1)
+    uv, vis = project_keypoints(kp_world, cam_pos, cam_mat, fovy, W, H)
+    B = uv.shape[0]
+    u_pix = ((uv[..., 0] + 1.0) * 0.5 * (W - 1)).round().long().clamp(0, W - 1)
+    v_pix = ((uv[..., 1] + 1.0) * 0.5 * (H - 1)).round().long().clamp(0, H - 1)
+    bidx = torch.arange(B, device=env.device).unsqueeze(1).expand(-1, self._K)
+    depth_at = cam.data.depth[bidx, v_pix, u_pix, 0]
+    from mjlab.tasks.velocity.mdp.field_keypoints import lift_pixels_to_world
+
+    pw = lift_pixels_to_world(uv, depth_at, cam_pos, cam_mat, fovy, W, H)
+    robot = env.scene["robot"]
+    base_pos = robot.data.root_link_pos_w
+    base_mat = matrix_from_quat(robot.data.root_link_quat_w)
+    rel = pw - base_pos.unsqueeze(1)
+    p_base = torch.einsum("bij,bkj->bki", base_mat.transpose(1, 2), rel)
+    w = vis.float() * ((depth_at > 0.05) & (depth_at < 30.0)).float()  # (B,K)
+    base_yaw = torch.atan2(base_mat[:, 1, 0], base_mat[:, 0, 0])
+    kp_pack = torch.cat(
+      [p_base[..., 0], p_base[..., 1], w], dim=1
+    )  # (B, 3K): x[K], y[K], w[K]
+    pose = torch.stack([base_pos[:, 0], base_pos[:, 1], base_yaw], dim=-1)  # (B,3)
+    return torch.cat([kp_pack, pose], dim=1)  # (B, 3K+3)
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    sensor_name: str = "head_cam",
+    num_frames: int = 8,
+    stride: int = 4,
+  ) -> torch.Tensor:
+    from mjlab.tasks.velocity.mdp.field_keypoints import kabsch_se2
+
+    self._ensure_init(env)
+    frame = self._collect_frame(env)  # (B, 3K+3)
+    if self._buf is None:
+      self._buf = CircularBuffer(self._n, env.num_envs, env.device)
+    step = int(env.common_step_counter)
+    if step != self._last_step or not self._buf.is_initialized:
+      if not self._buf.is_initialized or self._steps_since_append >= self._stride - 1:
+        self._buf.append(frame)
+        self._steps_since_append = 0
+      else:
+        self._steps_since_append += 1
+      self._last_step = step
+    buf = self._buf.buffer  # (B, N, 3K+3) oldest->newest
+    B, N, _ = buf.shape
+    K = self._K
+
+    # Current (newest) frame's base pose is the target frame for odometry.
+    cur_pose = buf[:, -1, 3 * K:]  # (B,3) x,y,yaw
+    cx, cy, cyaw = cur_pose[:, 0], cur_pose[:, 1], cur_pose[:, 2]
+    ct, st = torch.cos(-cyaw), torch.sin(-cyaw)
+
+    pooled_x, pooled_y, pooled_w = [], [], []
+    ever = torch.zeros(B, K, device=env.device)
+    for i in range(N):
+      fx = buf[:, i, 0:K]
+      fy = buf[:, i, K:2 * K]
+      fw = buf[:, i, 2 * K:3 * K]
+      fyaw = buf[:, i, 3 * K + 2]
+      fpx, fpy = buf[:, i, 3 * K], buf[:, i, 3 * K + 1]
+      # frame-i base point -> world -> current base.
+      cf, sf = torch.cos(fyaw), torch.sin(fyaw)
+      wx = cf.unsqueeze(1) * fx - sf.unsqueeze(1) * fy + fpx.unsqueeze(1)
+      wy = sf.unsqueeze(1) * fx + cf.unsqueeze(1) * fy + fpy.unsqueeze(1)
+      dx, dy = wx - cx.unsqueeze(1), wy - cy.unsqueeze(1)
+      bx = ct.unsqueeze(1) * dx - st.unsqueeze(1) * dy
+      by = st.unsqueeze(1) * dx + ct.unsqueeze(1) * dy
+      pooled_x.append(bx)
+      pooled_y.append(by)
+      pooled_w.append(fw)
+      ever = torch.maximum(ever, (fw > 0).float())
+    px = torch.cat(pooled_x, dim=1)  # (B, N*K)
+    py = torch.cat(pooled_y, dim=1)
+    pw = torch.cat(pooled_w, dim=1)
+    p_base_xy = torch.stack([px, py], dim=-1)  # (B, N*K, 2)
+    map_xy = self._kp_local[..., :2].unsqueeze(0).expand(B, -1, -1).repeat(1, N, 1)
+    yaw_r, t_r = kabsch_se2(p_base_xy, map_xy, pw)
+
+    command = _dribble_cmd(env, command_name)
+    x_n = t_r[:, 0] / command.cfg.half_length
+    y_n = t_r[:, 1] / command.cfg.half_width
+    cosr, sinr = torch.cos(yaw_r), torch.sin(yaw_r)
+    Rx = cosr.unsqueeze(1) * p_base_xy[..., 0] - sinr.unsqueeze(1) * p_base_xy[..., 1]
+    Ry = sinr.unsqueeze(1) * p_base_xy[..., 0] + cosr.unsqueeze(1) * p_base_xy[..., 1]
+    pred = torch.stack([Rx + t_r[:, 0:1], Ry + t_r[:, 1:2]], dim=-1)
+    resid = (torch.linalg.norm(pred - map_xy, dim=-1) * pw).sum(1) / pw.sum(1).clamp(min=1.0)
+    vis_now = buf[:, -1, 2 * K:3 * K].sum(1) / float(K)
+    uniq_frac = ever.sum(1) / float(K)
+    # Cache for the active_scan_coverage reward (read, don't recompute geometry).
+    self._last_uniq = uniq_frac.detach()
+    self._last_resid = resid.detach()
+    self._last_xy_n = torch.stack([x_n, y_n], dim=-1).detach()  # (B,2) for monitor
+    return torch.stack(
+      [x_n, y_n, sinr, cosr, vis_now, uniq_frac, resid], dim=-1
+    )  # (B,7)
