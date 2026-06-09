@@ -1602,3 +1602,67 @@ def mos92_soccer_e2e_dualcam_ekf_kick_oob_env_cfg(
     params={"term_name": "out_of_field_bounds"},
   )
   return cfg
+
+
+def mos92_soccer_e2e_dualcam_ekf_kick_oob_soft_env_cfg(
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """v4 EXP18: add DENSE soft-boundary shaping on top of EXP17's oob fix.
+
+  EXP17 proved the ``time_out`` semantic fix is correct: out_of_bounds dropped
+  0.345 -> 0.262 WITHOUT collapsing the real shot rate (0.30, within noise of
+  EXP16's 0.32) and fell_over/pos_err held. But it stalled short of the <=0.20
+  target, and the diagnosis is clear from the logs: ``oob_penalty_frac ~ 2e-4``
+  — the one-shot terminal penalty fires on almost no steps, so its dt-scaled
+  ~0.10 magnitude is far too sparse to outweigh the ~3.2 peak-kick payoff that
+  pulls the robot goalward over the line (robot_to_ball rose to 1.12 as the
+  policy chased fast balls off the field). This is the EXP16 "kick hard -> ball
+  flies -> chase -> cross line" mechanism, only lessened.
+
+  EXP18 keeps everything EXP17 proved (time_out=False + one-shot penalty + goal
+  corridor) and adds the research doc's step 3 — a CONTINUOUS gradient near the
+  edge so the cost is felt every step, long before the line is crossed:
+    - soft_boundary_penalty: penalize the depth (m) into a soft band that starts
+      ``soft_margin`` (1.5 m) inside each hard line. Weight small (-0.3) so it
+      shapes without crushing ball-chasing.
+    - velocity_toward_boundary_penalty: penalize outward root speed, but ONLY in
+      that soft band — directly targets the over-run-after-kick behavior while
+      never penalizing mid-field chasing.
+  Both honor the goal-mouth corridor, so legitimate goalward shots are exempt.
+
+  Bootstraps from EXP17 model_1999 (same obs layout, no std reset). Target:
+  out_of_bounds <= 0.20 WHILE the real shot rate holds ~0.30 and the guardrails
+  (fell_over < 0.1, pos_err < 1.1) stay put. Red line (research): if shot rate
+  collapses or robot_to_ball climbs, the soft weights are too harsh — back off.
+  """
+  cfg = mos92_soccer_e2e_dualcam_ekf_kick_oob_env_cfg(play=play)
+
+  field_cfg = SoccerFieldCfg()
+  goal_corridor_half_width = field_cfg.goal_inner_half_width + 0.3  # 1.3 m
+  goal_buffer = 0.6
+  soft_margin = 1.5  # soft band starts 1.5 m inside each hard line.
+
+  boundary_params = {
+    "half_length": field_cfg.half_length,
+    "half_width": field_cfg.half_width,
+    "soft_margin": soft_margin,
+    "goal_corridor_half_width": goal_corridor_half_width,
+    "goal_buffer": goal_buffer,
+  }
+
+  # Dense depth shaping: small weight, continuous per-step gradient near the edge.
+  cfg.rewards["soft_boundary"] = RewardTermCfg(
+    func=mdp.soft_boundary_penalty,
+    weight=-0.3,
+    params=boundary_params,
+  )
+  # Outward-velocity penalty in the soft band: directly damps over-run after a
+  # hard kick. Slightly stronger than depth since it is gated to near-edge AND
+  # outward motion (rarely fires mid-field), so it can be sharper without
+  # discouraging ball chasing.
+  cfg.rewards["vel_toward_boundary"] = RewardTermCfg(
+    func=mdp.velocity_toward_boundary_penalty,
+    weight=-0.5,
+    params=boundary_params,
+  )
+  return cfg

@@ -638,6 +638,108 @@ def out_of_bounds_penalty(
   return term.float()
 
 
+def soft_boundary_penalty(
+  env: ManagerBasedRlEnv,
+  half_length: float = 11.0,
+  half_width: float = 7.0,
+  soft_margin: float = 1.5,
+  goal_corridor_half_width: float = 0.0,
+  goal_buffer: float = 0.0,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """v4 EXP18: dense per-step penalty for being inside the soft boundary band.
+
+  Register with a NEGATIVE weight. EXP17 proved the ``time_out`` fix is correct
+  (OOB 0.345->0.262 without collapsing the shot rate) but the one-shot
+  ``out_of_bounds_penalty`` fires on almost no steps (oob_penalty_frac ~2e-4) —
+  far too sparse to outweigh the ~3.2 peak-kick payoff that pulls the robot
+  goalward over the line. This term gives a CONTINUOUS gradient: it returns the
+  positive depth (m) by which the root has entered the soft band that starts
+  ``soft_margin`` inside each hard OOB line, so the policy feels the cost growing
+  every step it lingers near the edge — long before it crosses.
+
+  The band geometry mirrors ``out_of_field_bounds`` so the soft region sits just
+  inside the hard line, including the goal-mouth corridor: inside
+  ``|y| < goal_corridor_half_width`` the +/-x soft line is pushed out by
+  ``goal_buffer`` so shooting into the mouth is not softly penalized.
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+  root_xy = asset.data.root_link_pos_w[:, :2]
+  abs_x = root_xy[:, 0].abs()
+  abs_y = root_xy[:, 1].abs()
+
+  hard_x = max(0.0, half_length)
+  if goal_corridor_half_width > 0.0:
+    in_corridor = abs_y < goal_corridor_half_width
+    hard_x_t = torch.where(
+      in_corridor,
+      torch.full_like(abs_x, half_length + goal_buffer),
+      torch.full_like(abs_x, hard_x),
+    )
+  else:
+    hard_x_t = torch.full_like(abs_x, hard_x)
+
+  # Depth into the soft band (>=0); zero when comfortably inside.
+  depth_x = (abs_x - (hard_x_t - soft_margin)).clamp(min=0.0)
+  depth_y = (abs_y - (half_width - soft_margin)).clamp(min=0.0)
+  depth = depth_x + depth_y
+  env.extras["log"]["Metrics/soft_boundary_depth"] = depth.mean()
+  return depth
+
+
+def velocity_toward_boundary_penalty(
+  env: ManagerBasedRlEnv,
+  half_length: float = 11.0,
+  half_width: float = 7.0,
+  soft_margin: float = 1.5,
+  goal_corridor_half_width: float = 0.0,
+  goal_buffer: float = 0.0,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """v4 EXP18: penalize outward root velocity only when near a boundary.
+
+  Register with a NEGATIVE weight. Complements ``soft_boundary_penalty``: the
+  depth term punishes *being* near the edge, this one punishes *moving toward*
+  it, which is exactly the "charge goalward and over-run the line after a hard
+  kick" behavior (robot_to_ball rose to 1.12 in EXP17 as the policy chased
+  fast-moving balls off the field). Returns the outward speed component (m/s,
+  >=0) summed over x and y, gated to the soft band so mid-field motion (chasing
+  the ball) is never penalized — only motion that is both near a line AND
+  heading out of bounds.
+
+  The goal-mouth corridor is honored exactly as in ``soft_boundary_penalty`` so
+  a legitimate goalward shot through the mouth is not penalized for its outward
+  x-velocity.
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+  root_xy = asset.data.root_link_pos_w[:, :2]
+  root_vxy = asset.data.root_link_lin_vel_w[:, :2]
+  abs_x = root_xy[:, 0].abs()
+  abs_y = root_xy[:, 1].abs()
+
+  hard_x = max(0.0, half_length)
+  if goal_corridor_half_width > 0.0:
+    in_corridor = abs_y < goal_corridor_half_width
+    hard_x_t = torch.where(
+      in_corridor,
+      torch.full_like(abs_x, half_length + goal_buffer),
+      torch.full_like(abs_x, hard_x),
+    )
+  else:
+    hard_x_t = torch.full_like(abs_x, hard_x)
+
+  # Outward velocity = velocity projected onto the sign of the position (so it is
+  # positive when moving away from center), clamped >=0.
+  v_out_x = (root_vxy[:, 0] * torch.sign(root_xy[:, 0])).clamp(min=0.0)
+  v_out_y = (root_vxy[:, 1] * torch.sign(root_xy[:, 1])).clamp(min=0.0)
+
+  near_x = abs_x > (hard_x_t - soft_margin)
+  near_y = abs_y > (half_width - soft_margin)
+  penalty = v_out_x * near_x.float() + v_out_y * near_y.float()
+  env.extras["log"]["Metrics/vel_toward_boundary"] = penalty.mean()
+  return penalty
+
+
 def goal_progress(
   env: ManagerBasedRlEnv,
   command_name: str,
