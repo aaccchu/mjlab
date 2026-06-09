@@ -962,3 +962,16 @@ readout 末100采样:**真实射门率 0.319(子集)**=goal_rate 0.154/tgt_is_go
 **bootstrap**: EXP16 model_1999,**无std重置**(踢球技能已学会,只改边界激励;smoke确认actor25/critic12全load、reinit0)。
 **判据**: ① out_of_bounds降向≤0.20 ② 同时真实射门率守住~0.32 ③ 护栏fell_over<0.1、pos_err<1.1。
 **失败信号(研究红线)**: 若射门率塌或robot_to_ball升→惩罚过重/走廊过窄,回退weight。脚本scripts/spike_v4_e2e_ekf_kick_oob.py,日志/tmp/v4_exp17_full.log。
+
+### EXP17 中期判读(iter~400/2000,启动transient已清)
+末80采样(避开iter5的fell_over启动尖峰6.79):
+| 指标 | EXP16终 | EXP17 iter~400 | 判定 |
+|---|---|---|---|
+| out_of_bounds | 0.345 | **0.215** | ✅ 降~38%,向≤0.20 |
+| 真实射门率 | 0.319 | 0.250(回升中) | ⏳ bootstrap后先掉再回,未到稳态 |
+| fell_over | 0.044 | 0.061 | ✅ 守住<0.1 |
+| pos_err | 0.91 | 0.95 | ✅ 护栏 |
+| ball_speed_peak | 2.96 | 2.87 | ✅ 踢力保留 |
+| robot_to_ball | 0.91 | 0.80 | ✅ 未变保守 |
+**关键**:修复按设计生效——out_of_bounds 降 while 射门率回升、护栏守住。**robot_to_ball 没升**→研究红线的"策略变保守不敢追球"失败模式未出现。继续训练观察稳态。
+**判读陷阱留痕**:bootstrap 启动时 init_at_random_ep_len 致 fell_over 读数飙到3-6(同时reset的计数artifact),前~50iter单调衰减回0-0.16,非失稳;readout窗口含启动段会虚高,要看raw末段或窄窗口。
