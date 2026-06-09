@@ -338,3 +338,12 @@ codex 红线仍守:oracle 检测隔离感知变量、安全课程先行、各阶
 RoboCup 调研 + EKF 重构方案已独立存为 `soccer_robot_v4_localization_method.md`(方法论+R1/R2/R3 重构设计)。
 **核心转向**:当前"点云拼接+单次Kabsch"架构选错,EXP11 修 append bug 后仍 ~2.1m 印证天花板。
 线A 下一步=把 FusedPoseBelief 重构为 EKF/UKF 递归滤波(R1)+ 对称消歧(R2)+ 解析熵减主动视觉(R3)。
+
+## 十三、踢球链方法论文档(2026-06-09,线B)
+线B 调研+路线图已独立存为 `soccer_robot_v4_kickchain_method.md`。
+**根因(三方交叉钉死)**:不是奖励问题(核实 EXP13 已有 goal_progress 球速朝门投影 +2.0、
+粘球卡球已重罚)。真根因=codex C20a 发现"球到脚边时相机看不见"(触球瞬间 seg_visible=0.000),
+缺一个**输入为短时 ball belief 的独立"近脚盲推/踢球技能(contact primitive)"**。
+上帝视角注入命令也只 0.018 vs 上界 0.68,证明是动作技能缺失,非奖励/阈值问题。
+**线B 路线**:B1 短时 ball belief → B2 近脚窗口专训踢球技能(impulse奖励+踢腿参考) →
+B3 teacher-distillation 合并接近专家+踢球专家(按状态正则退火)。全程仍 oracle 检测,多指标判读。
