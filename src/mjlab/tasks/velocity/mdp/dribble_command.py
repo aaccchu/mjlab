@@ -65,6 +65,17 @@ class DribbleCommand(CommandTerm):
     # Step-level 0->1 transition signal for the sparse goal reward.
     self.newly_scored = torch.zeros(self.num_envs, device=self.device)
     self.metrics["goal_rate"] = torch.zeros(self.num_envs, device=self.device)
+    # Per-episode flag: is THIS episode's target the goal mouth (vs a random
+    # point)? Only goal-target episodes can meaningfully score, so the global
+    # goal_rate is capped by goal_target_fraction. Logging this lets the readout
+    # compute the TRUE shooting rate: goal_rate_subset = mean(goal_rate)/mean(
+    # target_is_goal), i.e. goals per goal-target episode.
+    self.target_is_goal = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["target_is_goal"] = torch.zeros(self.num_envs, device=self.device)
+    # Peak goalward ball speed during the episode (m/s). The plain ball_speed
+    # metric averages in all the standing-still steps, so "gentle push" and "rare
+    # hard kick + mostly idle" both read ~0.4; peak speed separates them.
+    self.metrics["ball_speed_peak"] = torch.zeros(self.num_envs, device=self.device)
 
     # Anti-cheat state (rule penalties consume these; see rewards.py).
     # ball_speed: world-frame ball xy speed (m/s), the core "is the ball moving"
@@ -120,6 +131,11 @@ class DribbleCommand(CommandTerm):
     dt = self._env.step_dt
     ball_speed = torch.norm(self.ball_lin_vel_w[:, :2], dim=-1)
     self.metrics["ball_speed"] = ball_speed
+    # Track the episode peak ball speed (running max), so "gentle push" (peak ~0.4)
+    # is distinguishable from "real kick" (peak >1). Resets to 0 at resample.
+    self.metrics["ball_speed_peak"] = torch.maximum(
+      self.metrics["ball_speed_peak"], ball_speed
+    )
     is_holding = (robot_to_ball < 0.4) & (ball_speed < 0.2)
     self.metrics["holding_time"] = torch.where(
       is_holding,
@@ -149,6 +165,9 @@ class DribbleCommand(CommandTerm):
     self.newly_scored = (in_goal_f * (1.0 - self.goal_scored)).clamp_min(0.0)
     self.goal_scored = torch.maximum(self.goal_scored, in_goal_f)
     self.metrics["goal_rate"] = self.goal_scored
+    # Expose which episodes had the goal as target, so the readout can divide
+    # goals by goal-target-episode count for the true shooting rate.
+    self.metrics["target_is_goal"] = self.target_is_goal
 
   def compute_success(self) -> torch.Tensor:
     return self.metrics["ball_to_target_error"] < self.cfg.success_threshold
@@ -172,6 +191,7 @@ class DribbleCommand(CommandTerm):
     self.metrics["step_count"][env_ids] = 0.0
     self.metrics["holding_time"][env_ids] = 0.0
     self.metrics["ball_stuck_time"][env_ids] = 0.0
+    self.metrics["ball_speed_peak"][env_ids] = 0.0
 
     # Robot spawn pose lives in fresh qpos at reset time; xpos (root_link_pos_w)
     # is still stale here because no sim.forward() runs between the reset event
@@ -279,6 +299,9 @@ class DribbleCommand(CommandTerm):
         [goal_x + center_xy[:, 0], goal_y + center_xy[:, 1]], dim=-1
       )
       target_xy = torch.where(use_goal.unsqueeze(-1), goal_xy, target_xy)
+      self.target_is_goal[env_ids] = use_goal.float()
+    else:
+      self.target_is_goal[env_ids] = 0.0
 
     z = torch.full((n,), self.cfg.ball_radius, device=self.device)
     self.target_pos[env_ids] = torch.cat([target_xy, z.unsqueeze(-1)], dim=-1)
