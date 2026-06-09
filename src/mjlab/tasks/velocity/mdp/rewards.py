@@ -541,6 +541,7 @@ def dribble_kick_impulse(
   env: ManagerBasedRlEnv,
   sensor_name: str,
   command_name: str,
+  speed_threshold: float = 0.0,
 ) -> torch.Tensor:
   """v4 line-B B2: reward the QUALITY of a foot-ball kick, not just that contact
   happened. At a foot-ball contact step, reward the ball speed projected onto the
@@ -548,7 +549,15 @@ def dribble_kick_impulse(
   reward); a goalward burst gets the full reward — so the policy learns to strike
   hard toward the goal at the contact moment, which the binary dribble_kick_contact
   cannot teach. Goal aim point mirrors goal_progress (goal line in +x at the ball's
-  clamped y)."""
+  clamped y).
+
+  speed_threshold (m/s): only reward when the goalward ball speed EXCEEDS this, i.e.
+  gate out "gentle pushing". A per-step projected-speed reward without a threshold
+  has a known local optimum where the policy learns to keep nudging the ball slowly
+  (continuous contact pays more in integral than one hard strike that leaves the
+  foot). EXP14 plateaued at goal_rate~0.11 with ball_speed stuck ~0.39 — the classic
+  symptom. Setting the threshold above the nudge speed forces a real strike to score.
+  """
   contact_sensor: ContactSensor = env.scene[sensor_name]
   data = contact_sensor.data
   assert data.found is not None
@@ -566,7 +575,11 @@ def dribble_kick_impulse(
   goal_xy = torch.stack([goal_x, goal_y], dim=-1)
   to_goal = goal_xy - ball_xy
   dir_to_goal = to_goal / (torch.norm(to_goal, dim=-1, keepdim=True) + 1e-6)
-  projected = torch.sum(ball_vel_xy * dir_to_goal, dim=-1).clamp_min(0.0)
+  projected = torch.sum(ball_vel_xy * dir_to_goal, dim=-1)
+  # Gate out gentle pushing: zero reward unless the goalward speed clears threshold.
+  projected = torch.where(
+    projected > speed_threshold, projected, torch.zeros_like(projected)
+  )
   return in_contact * projected
 
 

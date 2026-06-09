@@ -1524,6 +1524,12 @@ def mos92_soccer_e2e_dualcam_ekf_kick_env_cfg(
   cfg.rewards["kick_impulse"] = RewardTermCfg(
     func=mdp.dribble_kick_impulse,
     weight=1.5,
-    params={"sensor_name": "foot_ball_contact", "command_name": "dribble"},
+    params={
+      "sensor_name": "foot_ball_contact",
+      "command_name": "dribble",
+      # Gate out gentle pushing: EXP14 stalled with ball_speed~0.39, so only reward
+      # goalward strikes above 0.6 m/s to push the policy from "nudge" to "kick".
+      "speed_threshold": 0.6,
+    },
   )
   return cfg

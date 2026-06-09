@@ -114,6 +114,23 @@ def main() -> None:
     )
     print(f"[INFO] actor : loaded {a_load}, reinit {a_re} -> {a_notes}")
     print(f"[INFO] critic: loaded {c_load}, reinit {c_re} -> {c_notes}")
+    # Reopen exploration: the EXP13 bootstrap inherits a COLLAPSED action std
+    # (std_param mean~0.75, min~0.44) from the conservative "walk + gentle approach"
+    # policy. PPO's Gaussian won't spontaneously re-explore "explosive kick" from
+    # that narrow distribution (the bottleneck both the research and EXP14's
+    # ball_speed~0.39 plateau point to). Reset std_param to ~1.0 so the policy can
+    # rediscover large leg swings; PPO anneals it back down as the kick skill forms.
+    with torch.no_grad():
+      actor = runner.alg._raw_actor
+      dist = getattr(actor, "distribution", None)
+      if dist is not None and hasattr(dist, "std_param"):
+        dist.std_param.fill_(1.0)  # linear std
+        print("[INFO] reset action std_param -> 1.0 (reopen kick exploration)")
+      elif dist is not None and hasattr(dist, "log_std_param"):
+        dist.log_std_param.fill_(0.0)  # log std: log(1.0)=0
+        print("[INFO] reset action log_std_param -> 0.0 (reopen kick exploration)")
+      else:
+        print("[WARN] no std param found to reset; exploration unchanged")
   else:
     print(f"[WARN] bootstrap ckpt missing ({BASE_CKPT}); training from scratch.")
 
