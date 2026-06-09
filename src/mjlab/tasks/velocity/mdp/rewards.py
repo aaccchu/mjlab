@@ -537,6 +537,39 @@ def dribble_kick_contact(
   return (data.found.sum(dim=-1) > 0).float()
 
 
+def dribble_kick_impulse(
+  env: ManagerBasedRlEnv,
+  sensor_name: str,
+  command_name: str,
+) -> torch.Tensor:
+  """v4 line-B B2: reward the QUALITY of a foot-ball kick, not just that contact
+  happened. At a foot-ball contact step, reward the ball speed projected onto the
+  ball->goal direction (clamped >=0). A gentle tap leaves the ball slow (low
+  reward); a goalward burst gets the full reward — so the policy learns to strike
+  hard toward the goal at the contact moment, which the binary dribble_kick_contact
+  cannot teach. Goal aim point mirrors goal_progress (goal line in +x at the ball's
+  clamped y)."""
+  contact_sensor: ContactSensor = env.scene[sensor_name]
+  data = contact_sensor.data
+  assert data.found is not None
+  in_contact = (data.found.sum(dim=-1) > 0).float()
+  command = _dribble_cmd(env, command_name)
+  ball_xy = command.ball_pos_w[:, :2]
+  ball_vel_xy = command.ball_lin_vel_w[:, :2]
+  center_xy = env.scene.env_origins[:, :2]
+  goal_x = center_xy[:, 0] + command.cfg.goal_line_x - command.cfg.field_margin
+  goal_y = center_xy[:, 1] + torch.clamp(
+    ball_xy[:, 1] - center_xy[:, 1],
+    -command.cfg.goal_half_width,
+    command.cfg.goal_half_width,
+  )
+  goal_xy = torch.stack([goal_x, goal_y], dim=-1)
+  to_goal = goal_xy - ball_xy
+  dir_to_goal = to_goal / (torch.norm(to_goal, dim=-1, keepdim=True) + 1e-6)
+  projected = torch.sum(ball_vel_xy * dir_to_goal, dim=-1).clamp_min(0.0)
+  return in_contact * projected
+
+
 def gaze_at_ball(
   env: ManagerBasedRlEnv,
   command_name: str,

@@ -216,6 +216,29 @@ class DribbleCommand(CommandTerm):
       (n,),
       device=self.device,
     )
+    # Near-foot kick window (B2): for a fraction of episodes, override bearing +
+    # distance to drop the ball just in front of the robot's heading, so the
+    # policy starts already at the kick state and learns "ball-at-foot -> kick".
+    if self.cfg.near_foot_spawn_fraction > 0.0:
+      use_nf = (
+        sample_uniform(0.0, 1.0, (n,), device=self.device)
+        < self.cfg.near_foot_spawn_fraction
+      )
+      nf_rel = sample_uniform(
+        -self.cfg.near_foot_half_angle,
+        self.cfg.near_foot_half_angle,
+        (n,),
+        device=self.device,
+      )
+      nf_theta = wrap_to_pi(robot_yaw + nf_rel)  # frontal sector in world frame
+      nf_dist = sample_uniform(
+        self.cfg.near_foot_dist_range[0],
+        self.cfg.near_foot_dist_range[1],
+        (n,),
+        device=self.device,
+      )
+      theta = torch.where(use_nf, nf_theta, theta)
+      dist = torch.where(use_nf, nf_dist, dist)
     ball_offset = torch.stack(
       [dist * torch.cos(theta), dist * torch.sin(theta)], dim=-1
     )
@@ -391,6 +414,18 @@ class DribbleCommandCfg(CommandTermCfg):
   # Initial ball speed range (m/s); >0 makes the ball roll so the policy must
   # track a moving target. Direction is random in the xy plane.
   ball_init_speed_range: tuple[float, float] = (0.0, 0.0)
+
+  # --- Near-foot kick window (v4 line-B B2) ---
+  # Fraction of episodes that spawn the ball directly in the near-foot kick
+  # window (in front of the robot's heading, ~0.1m away) so the policy densely
+  # practices the "ball-at-foot -> kick goalward" skill it otherwise rarely
+  # reaches. codex C20a put real foot-ball contact at x_b~0.09m, |y_b|~0.025m;
+  # the default spawn_dist_range (>=0.6m) almost never starts there.
+  near_foot_spawn_fraction: float = 0.0
+  # Ball distance from the robot when near-foot spawned (m).
+  near_foot_dist_range: tuple[float, float] = (0.08, 0.20)
+  # Half-angle (rad) of the frontal sector the near-foot ball spawns into.
+  near_foot_half_angle: float = 0.35  # ~20deg cone in front of the heading.
 
   # Derived-twist shaping.
   max_speed: float = 1.0

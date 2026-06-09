@@ -1484,3 +1484,35 @@ def mos92_soccer_e2e_dualcam_ekf_env_cfg(
     },
   )
   return cfg
+
+
+def mos92_soccer_e2e_dualcam_ekf_kick_env_cfg(
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """v4 line-B B2: train the near-foot KICK SKILL on top of the EKF env (line A).
+
+  EXP13 (EKF) hit pos_err 0.98m and goal_rate 0.08 — localization is solved but the
+  final "ball-at-foot -> kick goalward" action is missing (codex upper bound 0.68 vs
+  0.018 even with god-view command injection => it's an action-skill gap, not a
+  perception or reward-axis gap). This env attacks that gap directly:
+    1. near_foot_spawn_fraction=0.5: half the episodes spawn the ball already in the
+       kick window (~0.1m in front of the heading) so the policy DENSELY practices
+       striking from the foot; the other half keep the full approach+dribble task so
+       the approach/locomotion/localization skills are not forgotten.
+    2. dribble_kick_impulse reward: rewards ball speed projected goalward AT the
+       contact step (kick quality), which binary kick_contact cannot teach.
+  Bootstraps from EXP13 (same 88-dim obs), so gait+approach+EKF-localization carry
+  over. Still oracle DETECTION (isolate the action-skill variable).
+  """
+  cfg = mos92_soccer_e2e_dualcam_ekf_env_cfg(play=play)
+
+  dribble = cfg.commands["dribble"]
+  dribble.near_foot_spawn_fraction = 0.5
+  dribble.near_foot_dist_range = (0.08, 0.20)
+
+  cfg.rewards["kick_impulse"] = RewardTermCfg(
+    func=mdp.dribble_kick_impulse,
+    weight=1.5,
+    params={"sensor_name": "foot_ball_contact", "command_name": "dribble"},
+  )
+  return cfg
