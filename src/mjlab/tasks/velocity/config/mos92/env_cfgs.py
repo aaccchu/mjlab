@@ -1666,3 +1666,57 @@ def mos92_soccer_e2e_dualcam_ekf_kick_oob_soft_env_cfg(
     params=boundary_params,
   )
   return cfg
+
+
+def mos92_soccer_e2e_dualcam_ekf_kick_oob_soft2_env_cfg(
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """v4 EXP19: STRENGTHEN the soft-boundary shaping (EXP18 weights were too weak).
+
+  EXP18 added dense soft-boundary shaping but out_of_bounds did not move from
+  EXP17's 0.262. The Episode_Reward magnitudes showed why: soft_boundary ~-0.03
+  and vel_toward_boundary ~-0.018, versus goal_progress ~+0.53 — the boundary
+  cost was ~20x smaller than the goalward pull driving the robot over the line,
+  so it could nudge but never override "charge goalward". Direction right,
+  magnitude wrong.
+
+  EXP19 raises the weights to the same order as goal_progress so the policy
+  genuinely trades off "shoot harder" against "stay in bounds", and widens the
+  soft band to warn earlier:
+    - soft_boundary_penalty: -0.3 -> -2.0
+    - velocity_toward_boundary_penalty: -0.5 -> -3.0
+    - soft_margin: 1.5 -> 2.0 m (earlier warning band).
+  Everything else (time_out=False, one-shot penalty, goal corridor) is unchanged
+  from EXP17/18. Bootstraps from EXP17 model_1999 (clean best-oob-fix start, NOT
+  the half-finished EXP18). Target: out_of_bounds <= 0.20 while the real shot
+  rate holds ~0.30 and guardrails stay put. Red line: if shot rate collapses or
+  robot_to_ball climbs, the weights overshot — back off toward EXP18.
+  """
+  cfg = mos92_soccer_e2e_dualcam_ekf_kick_oob_soft_env_cfg(play=play)
+
+  field_cfg = SoccerFieldCfg()
+  goal_corridor_half_width = field_cfg.goal_inner_half_width + 0.3  # 1.3 m
+  goal_buffer = 0.6
+  soft_margin = 2.0  # widen the soft band (EXP18 used 1.5) for earlier warning.
+
+  boundary_params = {
+    "half_length": field_cfg.half_length,
+    "half_width": field_cfg.half_width,
+    "soft_margin": soft_margin,
+    "goal_corridor_half_width": goal_corridor_half_width,
+    "goal_buffer": goal_buffer,
+  }
+
+  # Raise to goal_progress order (~0.5) so the boundary cost can actually offset
+  # the goalward pull instead of being a rounding error.
+  cfg.rewards["soft_boundary"] = RewardTermCfg(
+    func=mdp.soft_boundary_penalty,
+    weight=-2.0,
+    params=boundary_params,
+  )
+  cfg.rewards["vel_toward_boundary"] = RewardTermCfg(
+    func=mdp.velocity_toward_boundary_penalty,
+    weight=-3.0,
+    params=boundary_params,
+  )
+  return cfg
