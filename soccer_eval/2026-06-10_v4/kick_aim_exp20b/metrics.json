@@ -1,0 +1,37 @@
+{
+  "node": "EXP20b — aim-the-kick continuation (gaze pitch sign fix + neck_pitch unclamp + lateral alignment)",
+  "selected_as": "best deployment model to date (v4 kick chain)",
+  "source_ckpt": "logs/rsl_rl/mos92_velocity/2026-06-10_20-22-43_spike_v4_e2e_ekf_kick_aim2/model_1999.pt",
+  "window": "stable training-log windows from /tmp/v4_exp20b_full.log (multi-window)",
+  "headline": "real shot rate 0.32 -> 0.38-0.41 (+20% over the EXP16-19 plateau), the single largest gain of v4; five best-ever metrics at once",
+  "metrics_last100": {
+    "shot_rate": 0.368, "goal_rate": 0.188, "target_is_goal": 0.510,
+    "episode_success": 0.581, "possession": 543.2, "ball_speed_peak": 2.700,
+    "ball_to_tgt_err": 1.881, "ball_stuck_s": 0.793, "robot_to_ball": 0.599,
+    "fell_over": 0.063, "out_of_bounds": 0.202, "pos_err_m": 0.882
+  },
+  "shot_rate_windows": {"last400": 0.387, "last200": 0.381, "last100": 0.368, "last50": 0.410, "mid_run_peak": 0.416},
+  "vs_previous_best": {
+    "EXP16-19_shot_rate_plateau": "0.32-0.33",
+    "ball_to_tgt_err": "2.7-2.8 -> 1.88 (best ever)",
+    "robot_to_ball": "1.0-1.2 -> 0.60 (kick-and-chase loop eliminated)",
+    "out_of_bounds": "0.26 'structural floor' -> 0.20 (floor broken by better aim)",
+    "pos_err_m": "0.91-0.96 -> 0.85-0.88 (best ever)",
+    "episode_success": "0.45 -> 0.58 (best ever)"
+  },
+  "changes": [
+    "global fix: _gaze_uv_visible vertical sign (elev - neck_pitch -> elev + neck_pitch); verified by real-camera neck_pitch sweep (positive pitch = camera DOWN); old formula taught the policy to look UP at close ground balls",
+    "EXP20 env: neck_pitch pose-reward std 0.1/0.15 -> 1.0 so the (now sign-correct) gaze rewards can pitch the head down",
+    "new reward kick_lateral_alignment (w=1.0): |y_b| -> 0 while ball in frontal band x_b in [0.15,1.0] m (square up before striking; codex C21l2 measured 13x contact-window from this lever)"
+  ],
+  "guardrails": {
+    "ball_speed_peak": "3.2 -> 2.70 SLOW DECLINE — held above the 2.5 red line but watch in any further training (alignment may be trading off kick power; ball-hugging attractor risk)",
+    "fell_over": "0.063 < 0.1 ok",
+    "pos_err": "0.88 < 1.1 ok (look-down did NOT hurt localization; improved it)"
+  },
+  "caveats": [
+    "Numbers from training stdout stable windows, computed identically to EXP16-19 (trend-reliable), not a fresh headless eval.",
+    "Still oracle ball detection (B1 real-detector stage untouched).",
+    "Ultimate target 0.5-0.6 still ~0.1-0.2 away; GT-command upper-bound probe (codex-style) not yet run to calibrate physical reachability within 20 s episodes."
+  ]
+}

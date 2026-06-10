@@ -1,0 +1,15 @@
+{
+  "ckpt": "checkpoints/v4_soccer/kick_aim_exp20b/model_1999.pt",
+  "video": "soccer_eval/2026-06-10_v4/kick_aim_exp20b/kick_aim_exp20b_pov_belief.mp4",
+  "episode_len": 1000,
+  "scored": true,
+  "fps": 30,
+  "final_loc_err_m": 1.875,
+  "mean_loc_err_m": 0.235,
+  "start_loc_err_m": 1.507,
+  "ball_in_view_frac": 0.302,
+  "first_ball_sighting_step": 111,
+  "num_kicks": 18,
+  "robot_distance_m": 7.53,
+  "note": "NO explicit ball estimate exists: ball info is implicit in the camera CNN (depth + 6-frame RGB stack). The map shows TRUE ball (white) and the LAST CAMERA SIGHTING (cyan) \u2014 ball knowledge begins at first_ball_sighting_step. NEW IN EXP20b: the gaze-pitch sign fix + unclamped neck_pitch let the policy LOOK DOWN \u2014 the video shows 'ball IN VIEW (0.7 m)' frames, i.e. the ball visible well below the old ~1.25 m blind-spot threshold that constrained EXP16/19."
+}
