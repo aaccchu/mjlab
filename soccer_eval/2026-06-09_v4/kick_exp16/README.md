@@ -14,6 +14,17 @@
 - `kick_exp16_goalward.mp4` — 球被驱向球门(本段**捕到真实进球**,`scenarios.json` 中 `scored: true`)。
 - `*_<scenario>.png` — 每段中点静帧;`scenarios.json` — 选取窗口与进球标记。
 
+## 产物(机器人视觉 POV + 自定位信念演示)
+由 `scripts/eval_v4_pov_belief_exp16.py`(共用 `scripts/_v4_pov_belief_video.py`)生成,
+完整一个 episode 的三联画(31/14s,30fps):
+- `kick_exp16_pov_belief.mp4` — 左:机器人头部相机 POV(`head_cam_rgb`,策略 CNN 实际输入);
+  中:俯视球场 GT 位姿(绿)vs 策略融合信念(红 x,即策略消费的 `_last_xy_n`)+ 球(白)+ 目标(黄星),带拖尾;
+  右:定位误差(米)与融合视野覆盖率(uniq_frac)随时间曲线。
+- `pov_belief.json` — episode 统计(是否进球、首/末/均定位误差、起始/最大覆盖率)。
+- **本段叙事**:**start_coverage 0.04(刚 reset 几乎看不到场地信息,定位误差 ~5.3m)→
+  机器人转身扫视,覆盖率升、误差在 ~step40 骤降到 ~0.3m → 带球射门并进球(`scored: true`,
+  step414 结束)**。正是"一开始看不到→调整后看到→踢球进门"的完整链路。
+
 ## 核心确证(末100稳态,四轮同法对照)
 - 真实射门率 0.319、episode_success 0.479(四轮最高)、robot_to_ball 0.914(四轮最优)。
 - **out_of_bounds 0.345(四轮最差)= EXP17-19 修复对象**。

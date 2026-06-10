@@ -1,0 +1,11 @@
+{
+  "ckpt": "checkpoints/v4_soccer/kick_exp16/model_1999.pt",
+  "video": "soccer_eval/2026-06-09_v4/kick_exp16/kick_exp16_pov_belief.mp4",
+  "episode_len": 414,
+  "scored": true,
+  "fps": 30,
+  "final_loc_err_m": 0.995,
+  "mean_loc_err_m": 0.634,
+  "start_coverage": 0.043,
+  "max_coverage": 0.174
+}
