@@ -23,6 +23,8 @@ DIMENSIONS = {
     ("Metrics/dribble/ball_path_length", "ball_path", True),
     ("Metrics/dribble/ball_speed", "ball_speed", True),
     ("Metrics/dribble/ball_speed_peak", "ball_speed_peak", True),
+    ("Metrics/dribble/ball_in_finish_box", "ball_in_box", True),
+    ("Metrics/dribble/ball_deepest_x", "ball_deep_x", True),
     ("Metrics/dribble/ball_to_target_error", "ball_to_tgt_err", False),
     ("Metrics/dribble/ball_stuck_time", "ball_stuck_s", False),
     ("Metrics/dribble/robot_to_ball_error", "robot_to_ball", False),

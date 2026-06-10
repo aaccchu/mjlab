@@ -76,6 +76,15 @@ class DribbleCommand(CommandTerm):
     # metric averages in all the standing-still steps, so "gentle push" and "rare
     # hard kick + mostly idle" both read ~0.4; peak speed separates them.
     self.metrics["ball_speed_peak"] = torch.zeros(self.num_envs, device=self.device)
+    # Finish diagnostics (v4 EXP21): per-episode "ball ever reached the finish
+    # box" latch + deepest ball x. With goal_rate these separate NEVER_ARRIVED
+    # from SHORT (arrived-but-stalled) live during training.
+    self.metrics["ball_in_finish_box"] = torch.zeros(
+      self.num_envs, device=self.device
+    )
+    self.metrics["ball_deepest_x"] = torch.full(
+      (self.num_envs,), -20.0, device=self.device
+    )
 
     # Anti-cheat state (rule penalties consume these; see rewards.py).
     # ball_speed: world-frame ball xy speed (m/s), the core "is the ball moving"
@@ -169,6 +178,23 @@ class DribbleCommand(CommandTerm):
     # goals by goal-target-episode count for the true shooting rate.
     self.metrics["target_is_goal"] = self.target_is_goal
 
+    # --- Finish diagnostics (v4 EXP21): the dominant miss is SHORT (ball stalls
+    # ~0.5 m from the line). Track per-episode (a) whether the ball ever reached
+    # the finish box (x > goal_line - 2, |y| < corridor-ish) and (b) the ball's
+    # deepest x — together with goal_rate these separate "never arrived" from
+    # "arrived but didn't finish" LIVE during training, which aggregate
+    # goal_rate cannot do.
+    in_box = (
+      (ball_local[:, 0] > self.cfg.goal_line_x - 2.0)
+      & (ball_local[:, 1].abs() < self.cfg.goal_half_width + 0.5)
+    ).float()
+    self.metrics["ball_in_finish_box"] = torch.maximum(
+      self.metrics["ball_in_finish_box"], in_box
+    )
+    self.metrics["ball_deepest_x"] = torch.maximum(
+      self.metrics["ball_deepest_x"], ball_local[:, 0]
+    )
+
   def compute_success(self) -> torch.Tensor:
     return self.metrics["ball_to_target_error"] < self.cfg.success_threshold
 
@@ -192,6 +218,10 @@ class DribbleCommand(CommandTerm):
     self.metrics["holding_time"][env_ids] = 0.0
     self.metrics["ball_stuck_time"][env_ids] = 0.0
     self.metrics["ball_speed_peak"][env_ids] = 0.0
+    self.metrics["ball_in_finish_box"][env_ids] = 0.0
+    # Max-tracker: 0.0 means "ball at midfield", so restart at a sentinel well
+    # below any reachable x (base reset zeroes all metrics; fix it up here).
+    self.metrics["ball_deepest_x"][env_ids] = -20.0
 
     # Robot spawn pose lives in fresh qpos at reset time; xpos (root_link_pos_w)
     # is still stale here because no sim.forward() runs between the reset event
