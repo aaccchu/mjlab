@@ -1,16 +1,15 @@
 {
   "ckpt": "checkpoints/v4_soccer/kick_exp16/model_1999.pt",
   "video": "soccer_eval/2026-06-09_v4/kick_exp16/kick_exp16_pov_belief.mp4",
-  "episode_len": 818,
+  "episode_len": 844,
   "scored": true,
   "fps": 30,
-  "final_loc_err_m": 3.833,
-  "mean_loc_err_m": 0.67,
-  "mean_believed_ball_err_m": 0.658,
-  "start_coverage": 0.043,
-  "max_coverage": 0.261,
-  "start_visible_now": 0.0,
-  "start_loc_err_m": 8.169,
-  "ball_in_view_frac": 0.131,
-  "note": "believed-ball offset = self-localization error propagated onto the ball (egocentric ball direction is GT; ball perception is implicit in the CNN, no explicit ball-xy output to read). ball_in_view_frac = fraction of steps the ball is inside the head-cam frustum; a ground ball only enters view beyond ~1.25 m (cam ~0.79 m high, ~0 deg pitch), so when dribbling/kicking (ball <1.25 m) it sits in the foot-zone blind spot and the policy relies on the EKF self-pose + RGB temporal memory, not the live ball pixels."
+  "final_loc_err_m": 1.945,
+  "mean_loc_err_m": 0.396,
+  "start_loc_err_m": 1.779,
+  "ball_in_view_frac": 0.197,
+  "first_ball_sighting_step": 88,
+  "num_kicks": 12,
+  "robot_distance_m": 8.33,
+  "note": "NO explicit ball estimate exists: ball info is implicit in the camera CNN (depth + 6-frame RGB stack). The map shows TRUE ball (white) and the LAST CAMERA SIGHTING (cyan) \u2014 ball knowledge begins at first_ball_sighting_step, when the ball first enters the frustum (>~1.25 m; closer is the foot-zone blind spot). neck_pitch is policy-controlled/unlimited but the current policy only pitches ~-11 deg, so it rarely looks fully down at a close ball."
 }
