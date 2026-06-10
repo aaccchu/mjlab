@@ -678,6 +678,7 @@ def soft_boundary_penalty(
   soft_margin: float = 1.5,
   goal_corridor_half_width: float = 0.0,
   goal_buffer: float = 0.0,
+  corridor_exempt_x: bool = False,
   asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
   """v4 EXP18: dense per-step penalty for being inside the soft boundary band.
@@ -695,6 +696,14 @@ def soft_boundary_penalty(
   inside the hard line, including the goal-mouth corridor: inside
   ``|y| < goal_corridor_half_width`` the +/-x soft line is pushed out by
   ``goal_buffer`` so shooting into the mouth is not softly penalized.
+
+  corridor_exempt_x (v4 EXP21): the corridor merely SHIFTS the x soft band out
+  by goal_buffer, so a robot finishing at x~10.3 still pays depth_x — EXP20b
+  forensics showed this makes goalward pushing in the mouth a NET LOSS
+  (-0.036/step vs +0.016 mid-field) and produced the dominant SHORT miss (44.6%:
+  ball stops at x~10.5, 0.5 m short). With this flag, inside the corridor the x
+  component is fully exempt (depth_x := 0); the y component stays, so drifting
+  sideways out of the mouth is still discouraged.
   """
   asset: Entity = env.scene[asset_cfg.name]
   root_xy = asset.data.root_link_pos_w[:, :2]
@@ -710,10 +719,13 @@ def soft_boundary_penalty(
       torch.full_like(abs_x, hard_x),
     )
   else:
+    in_corridor = torch.zeros_like(abs_x, dtype=torch.bool)
     hard_x_t = torch.full_like(abs_x, hard_x)
 
   # Depth into the soft band (>=0); zero when comfortably inside.
   depth_x = (abs_x - (hard_x_t - soft_margin)).clamp(min=0.0)
+  if corridor_exempt_x:
+    depth_x = torch.where(in_corridor, torch.zeros_like(depth_x), depth_x)
   depth_y = (abs_y - (half_width - soft_margin)).clamp(min=0.0)
   depth = depth_x + depth_y
   env.extras["log"]["Metrics/soft_boundary_depth"] = depth.mean()
@@ -727,6 +739,7 @@ def velocity_toward_boundary_penalty(
   soft_margin: float = 1.5,
   goal_corridor_half_width: float = 0.0,
   goal_buffer: float = 0.0,
+  corridor_exempt_x: bool = False,
   asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
   """v4 EXP18: penalize outward root velocity only when near a boundary.
@@ -740,9 +753,11 @@ def velocity_toward_boundary_penalty(
   the ball) is never penalized — only motion that is both near a line AND
   heading out of bounds.
 
-  The goal-mouth corridor is honored exactly as in ``soft_boundary_penalty`` so
-  a legitimate goalward shot through the mouth is not penalized for its outward
-  x-velocity.
+  corridor_exempt_x (v4 EXP21): the corridor merely shifts the x band out by
+  goal_buffer, so "sprint at the goal mouth to finish" was still billed as
+  "sprint at the boundary" (EXP20b forensics: net -0.036/step while finishing).
+  With this flag the x velocity component is fully exempt inside the corridor;
+  the y component stays so sliding sideways out of the mouth is still penalized.
   """
   asset: Entity = env.scene[asset_cfg.name]
   root_xy = asset.data.root_link_pos_w[:, :2]
@@ -759,6 +774,7 @@ def velocity_toward_boundary_penalty(
       torch.full_like(abs_x, hard_x),
     )
   else:
+    in_corridor = torch.zeros_like(abs_x, dtype=torch.bool)
     hard_x_t = torch.full_like(abs_x, hard_x)
 
   # Outward velocity = velocity projected onto the sign of the position (so it is
@@ -767,6 +783,8 @@ def velocity_toward_boundary_penalty(
   v_out_y = (root_vxy[:, 1] * torch.sign(root_xy[:, 1])).clamp(min=0.0)
 
   near_x = abs_x > (hard_x_t - soft_margin)
+  if corridor_exempt_x:
+    near_x = near_x & ~in_corridor
   near_y = abs_y > (half_width - soft_margin)
   penalty = v_out_x * near_x.float() + v_out_y * near_y.float()
   env.extras["log"]["Metrics/vel_toward_boundary"] = penalty.mean()

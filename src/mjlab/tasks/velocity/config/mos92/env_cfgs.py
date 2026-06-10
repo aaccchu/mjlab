@@ -1777,3 +1777,37 @@ def mos92_soccer_e2e_dualcam_ekf_kick_aim_env_cfg(
     params={"command_name": "dribble", "x_min": 0.15, "x_max": 1.0, "std": 0.15},
   )
   return cfg
+
+
+def mos92_soccer_e2e_dualcam_ekf_kick_finish_env_cfg(
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """v4 EXP21: UNBLOCK THE FINISH — exempt the goal corridor from the x-axis soft
+  boundary costs.
+
+  EXP20b forensics (193 goal episodes, scripts/diag_v4_shot_forensics.py): the
+  dominant miss is SHORT (44.6% — ball reaches median x=10.5, 0.5 m from the
+  line, then stalls; median 9 kicks, full 1000 steps). Kick speed near the goal
+  (x>7) is 0.47 m/s vs 0.69 mid-field: the policy finishes TIMIDLY. Mechanism
+  (numerically verified): the corridor only SHIFTS the x soft band out by
+  goal_buffer, so finishing at x~10.3 still pays soft_boundary depth_x AND
+  velocity_toward_boundary bills the goalward sprint as an outward sprint — net
+  reward while finishing in the mouth is -0.036/step vs +0.016 mid-field. The
+  reward structure literally talks the policy out of scoring.
+
+  Single-variable fix (everything else inherited from EXP20's aim env):
+  corridor_exempt_x=True on both soft terms — inside |y| < 1.3 m the x components
+  are fully exempt (depth_y / v_out_y kept, so sliding sideways out of the mouth
+  is still discouraged). The HARD termination at x = 11.6 in the corridor stays,
+  so true overruns still terminate (+ one-shot penalty).
+
+  Criteria: SHORT 44.6% -> <30%, near-goal kick speed 0.47 -> >0.6, real shot
+  rate 0.368 -> >=0.42. Guardrails: out_of_bounds <= 0.25 (the exemption may give
+  some back — accept up to EXP19's level but not EXP16's 0.345), fell_over < 0.1,
+  pos_err < 1.1, ball_speed_peak > 2.5.
+  """
+  cfg = mos92_soccer_e2e_dualcam_ekf_kick_aim_env_cfg(play=play)
+
+  for term in ("soft_boundary", "vel_toward_boundary"):
+    cfg.rewards[term].params["corridor_exempt_x"] = True
+  return cfg
