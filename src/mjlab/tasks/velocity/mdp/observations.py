@@ -177,10 +177,17 @@ def _gaze_uv_visible(
   u_ang = wrap_to_pi(ball_bearing_w - gaze_yaw)
   u = u_ang / _FOV_H
 
-  # Vertical: ball elevation angle relative to neck_pitch.
+  # Vertical: ball elevation angle relative to the camera pitch. SIGN (verified
+  # 2026-06-10 by rendering the real camera across a neck_pitch sweep): POSITIVE
+  # neck_pitch pitches the camera DOWN (+0.2/+0.4/+0.6 brings a ground ball into
+  # view and toward image center; negative never sees it). The camera's optical
+  # axis elevation is therefore -neck_pitch, and the ball's angle relative to it
+  # is elev - (-neck_pitch) = elev + neck_pitch. The old `elev - neck_pitch`
+  # rewarded LOOKING UP at a close ground ball (codex EXP7C3 found the same bug;
+  # fixing it took their ball-visible fraction 0.015 -> 0.254).
   elev = torch.atan2(vec_w[:, 2], dist_xy)
   neck_pitch = robot.data.joint_pos[:, asset_cfg.joint_ids][:, 1]
-  v_ang = wrap_to_pi(elev - neck_pitch)
+  v_ang = wrap_to_pi(elev + neck_pitch)
   v = v_ang / _FOV_V
 
   visible = ((u.abs() < 1.0) & (v.abs() < 1.0)).float()
@@ -273,10 +280,7 @@ class StackedCameraRGB(ManagerTermBase):
       # spans N*stride control steps (a head-sweep time window). Always append
       # on the first call after a reset (buffer uninitialized) so the freshly
       # reset rows get a real frame immediately.
-      if (
-        not self._buf.is_initialized
-        or self._steps_since_append >= self._stride - 1
-      ):
+      if not self._buf.is_initialized or self._steps_since_append >= self._stride - 1:
         self._buf.append(rgb)
         self._steps_since_append = 0
       else:
@@ -423,7 +427,9 @@ def _belief_from_uv(
   Rx = cos.unsqueeze(1) * p_base[..., 0] - sin.unsqueeze(1) * p_base[..., 1]
   Ry = sin.unsqueeze(1) * p_base[..., 0] + cos.unsqueeze(1) * p_base[..., 1]
   pred_map = torch.stack([Rx + t_r[:, 0:1], Ry + t_r[:, 1:2]], dim=-1)
-  resid = (torch.linalg.norm(pred_map - map_xy, dim=-1) * w).sum(1) / w.sum(1).clamp(min=1.0)
+  resid = (torch.linalg.norm(pred_map - map_xy, dim=-1) * w).sum(1) / w.sum(1).clamp(
+    min=1.0
+  )
   vis_frac = w.sum(1) / float(K)
   return torch.stack([x_n, y_n, sin, cos, vis_frac, resid], dim=-1)  # (B, 6)
 
@@ -567,7 +573,7 @@ class FusedPoseBelief(ManagerTermBase):
     K = self._K
 
     # Current (newest) frame's base pose is the target frame for odometry.
-    cur_pose = buf[:, -1, 3 * K:]  # (B,3) x,y,yaw
+    cur_pose = buf[:, -1, 3 * K :]  # (B,3) x,y,yaw
     cx, cy, cyaw = cur_pose[:, 0], cur_pose[:, 1], cur_pose[:, 2]
     ct, st = torch.cos(-cyaw), torch.sin(-cyaw)
 
@@ -575,8 +581,8 @@ class FusedPoseBelief(ManagerTermBase):
     ever = torch.zeros(B, K, device=env.device)
     for i in range(N):
       fx = buf[:, i, 0:K]
-      fy = buf[:, i, K:2 * K]
-      fw = buf[:, i, 2 * K:3 * K]
+      fy = buf[:, i, K : 2 * K]
+      fw = buf[:, i, 2 * K : 3 * K]
       fyaw = buf[:, i, 3 * K + 2]
       fpx, fpy = buf[:, i, 3 * K], buf[:, i, 3 * K + 1]
       # frame-i base point -> world -> current base.
@@ -604,8 +610,10 @@ class FusedPoseBelief(ManagerTermBase):
     Rx = cosr.unsqueeze(1) * p_base_xy[..., 0] - sinr.unsqueeze(1) * p_base_xy[..., 1]
     Ry = sinr.unsqueeze(1) * p_base_xy[..., 0] + cosr.unsqueeze(1) * p_base_xy[..., 1]
     pred = torch.stack([Rx + t_r[:, 0:1], Ry + t_r[:, 1:2]], dim=-1)
-    resid = (torch.linalg.norm(pred - map_xy, dim=-1) * pw).sum(1) / pw.sum(1).clamp(min=1.0)
-    vis_now = buf[:, -1, 2 * K:3 * K].sum(1) / float(K)
+    resid = (torch.linalg.norm(pred - map_xy, dim=-1) * pw).sum(1) / pw.sum(1).clamp(
+      min=1.0
+    )
+    vis_now = buf[:, -1, 2 * K : 3 * K].sum(1) / float(K)
     uniq_frac = ever.sum(1) / float(K)
     # Cache for the active_scan_coverage reward (read, don't recompute geometry).
     self._last_uniq = uniq_frac.detach()
@@ -638,16 +646,25 @@ class EkfPoseBelief(FusedPoseBelief):
   The _ekf_step math is the one validated in scripts/exp12_offline_ekf.py.
   """
 
-  def __init__(self, env, command_name, sensor_name="head_cam", num_frames=8,
-               stride=4, q_pos=0.02, q_yaw=0.02, r_meas=0.10):
+  def __init__(
+    self,
+    env,
+    command_name,
+    sensor_name="head_cam",
+    num_frames=8,
+    stride=4,
+    q_pos=0.02,
+    q_yaw=0.02,
+    r_meas=0.10,
+  ):
     super().__init__(env, command_name, sensor_name, num_frames, stride)
     self._q_pos = q_pos
     self._q_yaw = q_yaw
     self._r_meas = r_meas
-    self._mu = None       # (B,3)
-    self._Sigma = None    # (B,3,3)
+    self._mu = None  # (B,3)
+    self._Sigma = None  # (B,3,3)
     self._prev_gt = None  # (B,3) previous GT world base pose for odometry delta
-    self._map_xy = None   # (K,2)
+    self._map_xy = None  # (K,2)
 
   def _ensure_init(self, env: ManagerBasedRlEnv) -> None:
     super()._ensure_init(env)
@@ -656,9 +673,9 @@ class EkfPoseBelief(FusedPoseBelief):
     B, dev = env.num_envs, env.device
     self._map_xy = self._kp_local[:, :2].clone()  # (K,2) world landmark xy
     self._mu = torch.zeros(B, 3, device=dev)
-    self._Sigma = torch.diag(
-      torch.tensor([25.0, 25.0, 9.0], device=dev)
-    ).repeat(B, 1, 1)
+    self._Sigma = torch.diag(torch.tensor([25.0, 25.0, 9.0], device=dev)).repeat(
+      B, 1, 1
+    )
     self._prev_gt = None
     self._Q = torch.diag(
       torch.tensor([self._q_pos, self._q_pos, self._q_yaw], device=dev)
@@ -676,21 +693,20 @@ class EkfPoseBelief(FusedPoseBelief):
     # Reset envs go back to the wide prior; clear their odometry anchor so the
     # first post-reset frame does not apply a bogus cross-episode delta.
     self._mu[ids] = 0.0
-    self._Sigma[ids] = torch.diag(
-      torch.tensor([25.0, 25.0, 9.0], device=dev)
-    )
+    self._Sigma[ids] = torch.diag(torch.tensor([25.0, 25.0, 9.0], device=dev))
     if self._prev_gt is not None:
       self._prev_gt[ids] = float("nan")  # NaN marks "no valid previous pose"
 
-  def __call__(self, env, command_name, sensor_name="head_cam", num_frames=8,
-               stride=4) -> torch.Tensor:
+  def __call__(
+    self, env, command_name, sensor_name="head_cam", num_frames=8, stride=4
+  ) -> torch.Tensor:
     self._ensure_init(env)
     frame = self._collect_frame(env)  # (B, 3K+3)
     K, B, dev = self._K, env.num_envs, env.device
-    z_x, z_y = frame[:, 0:K], frame[:, K:2 * K]
-    z_w = frame[:, 2 * K:3 * K]               # (B,K) visibility weight
-    z_xy = torch.stack([z_x, z_y], dim=-1)    # (B,K,2) base-frame landmark obs
-    gt_world = frame[:, 3 * K:]               # (B,3) GT base pose (odometry source)
+    z_x, z_y = frame[:, 0:K], frame[:, K : 2 * K]
+    z_w = frame[:, 2 * K : 3 * K]  # (B,K) visibility weight
+    z_xy = torch.stack([z_x, z_y], dim=-1)  # (B,K,2) base-frame landmark obs
+    gt_world = frame[:, 3 * K :]  # (B,3) GT base pose (odometry source)
 
     # --- Predict: advance pose by GT odometry delta (NaN-safe for first frame). ---
     if self._prev_gt is None:
@@ -734,9 +750,7 @@ class EkfPoseBelief(FusedPoseBelief):
       eye3 = torch.eye(3, device=dev).unsqueeze(0)
       Sig_new = (eye3 - Kg @ H) @ self._Sigma
       self._Sigma = self._Sigma + m.unsqueeze(-1) * (Sig_new - self._Sigma)
-      self._mu[:, 2] = torch.atan2(
-        torch.sin(self._mu[:, 2]), torch.cos(self._mu[:, 2])
-      )
+      self._mu[:, 2] = torch.atan2(torch.sin(self._mu[:, 2]), torch.cos(self._mu[:, 2]))
 
     # --- Pack output (B,7), same layout as FusedPoseBelief. ---
     command = _dribble_cmd(env, command_name)

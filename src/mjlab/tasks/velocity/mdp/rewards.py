@@ -583,6 +583,39 @@ def dribble_kick_impulse(
   return in_contact * projected
 
 
+def kick_lateral_alignment(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  x_min: float = 0.15,
+  x_max: float = 1.0,
+  std: float = 0.15,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """v4 EXP20: reward squaring up to the ball before striking (lateral alignment).
+
+  The 0.32 shot-rate plateau decomposes as "kicks hard (peak 3.2 m/s) but the
+  ball lands scattered" — and a major scatter source is striking with the ball
+  laterally offset from the foot line (|y_b| large in the base frame), which
+  sends the ball off-axis. codex C21l2 measured a 13x contact-window gain from a
+  single lateral-alignment term, and our kick_research doc lists "惩罚 |y_b| 把
+  球摆正脚前" as an unplayed card.
+
+  Active only when the ball is IN FRONT in the kick approach band
+  (x_b in [x_min, x_max]): rewards exp(-(y_b/std)^2) so the policy lines its
+  body up so the ball sits on the foot line before contact. Zero when the ball
+  is behind, far, or to the side (approach/search phases are not constrained).
+  """
+  robot: Entity = env.scene[asset_cfg.name]
+  command = _dribble_cmd(env, command_name)
+  vec_w = command.ball_pos_w - robot.data.root_link_pos_w
+  ball_b = quat_apply_inverse(robot.data.root_link_quat_w, vec_w)
+  x_b, y_b = ball_b[:, 0], ball_b[:, 1]
+  in_band = ((x_b > x_min) & (x_b < x_max)).float()
+  aligned = torch.exp(-((y_b / std) ** 2))
+  env.extras["log"]["Metrics/kick_lat_align"] = (in_band * aligned).mean()
+  return in_band * aligned
+
+
 def gaze_at_ball(
   env: ManagerBasedRlEnv,
   command_name: str,

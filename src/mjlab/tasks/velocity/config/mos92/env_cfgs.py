@@ -1720,3 +1720,60 @@ def mos92_soccer_e2e_dualcam_ekf_kick_oob_soft2_env_cfg(
     params=boundary_params,
   )
   return cfg
+
+
+def mos92_soccer_e2e_dualcam_ekf_kick_aim_env_cfg(
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """v4 EXP20: AIM THE KICK — fix the look-down geometry and square up to the ball.
+
+  Shot rate has been stuck at 0.30-0.33 across EXP16-19 while ball_speed_peak is
+  3.2 (kicks hard) and ball_to_tgt_err rebounds after kicks (lands scattered):
+  the diagnosis is "kicks hard but doesn't aim". Three verified causes/levers:
+
+  1. GAZE PITCH SIGN BUG (verified by rendering the real camera): positive
+     neck_pitch pitches the camera DOWN, but `_gaze_uv_visible` computed
+     `elev - neck_pitch`, so every gaze reward consumer has been TEACHING the
+     policy to look UP at a close ground ball (measured policy neck_pitch range
+     [-0.19, +0.02] — pushed the wrong way). Fixed globally in observations.py;
+     this env inherits the fix. codex hit the same bug (EXP7C3): fixing it took
+     ball-visible fraction 0.015 -> 0.254.
+  2. POSE REWARD CLAMPS THE NECK: neck_pitch std is 0.1/0.15 (strong pull to 0)
+     while neck_yaw was long ago relaxed to 1.5 for scanning. Even with the sign
+     fixed, looking down would be fought by the pose reward — relax it here.
+  3. LATERAL ALIGNMENT (codex C21l2: 13x contact-window from this one term; our
+     kick_research doc lists it as an unplayed card): reward |y_b| -> 0 when the
+     ball is in the frontal approach band, so the robot squares up and the strike
+     sends the ball on-axis instead of scattering.
+
+  Inherits everything from EXP19 (time_out fix + goal corridor + strong soft
+  boundary). Bootstraps from EXP19 model_1999, NO std reset (codex lesson: the
+  "low-speed ball-hugging attractor" can wash out a kick chain within 50-200
+  iters of noisy finetuning — keep the tuned std, watch ball_speed_peak).
+
+  Criteria: real shot rate 0.32 -> >=0.40. Secondary evidence: neck_pitch usage
+  extends positive (looks down), close-range ball visibility up. Guardrails:
+  fell_over<0.1, pos_err<1.1 (WATCH: looking down trades off landmark coverage;
+  if pos_err breaks 1.1 the gaze weight needs backing off), ball_speed_peak>2.8
+  (anti ball-hugging).
+  """
+  cfg = mos92_soccer_e2e_dualcam_ekf_kick_oob_soft2_env_cfg(play=play)
+
+  # 2. Free the neck_pitch so the (now sign-correct) gaze rewards can actually
+  #    pitch the head down near the ball without the pose reward fighting it.
+  for key in ("std", "std_standing", "std_walking", "std_running"):
+    d = cfg.rewards["pose"].params.get(key)
+    if isinstance(d, dict):
+      for jk in list(d.keys()):
+        if "neck_pitch" in jk:
+          d[jk] = 1.0  # weak centering; gaze terms take over near the ball.
+
+  # 3. Square up before striking: |y_b| -> 0 while the ball is in the frontal
+  #    approach band. Weight modest — it shapes the last metre of approach, and
+  #    must not overpower dribble_approach/goal_progress mid-field.
+  cfg.rewards["kick_lateral_align"] = RewardTermCfg(
+    func=mdp.kick_lateral_alignment,
+    weight=1.0,
+    params={"command_name": "dribble", "x_min": 0.15, "x_max": 1.0, "std": 0.15},
+  )
+  return cfg
