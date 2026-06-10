@@ -1,0 +1,35 @@
+{
+  "ckpt": "checkpoints/v4_soccer/kick_oob_exp19/model_1999.pt",
+  "rollout_steps": 4000,
+  "fps": 50,
+  "clip_len_steps": 150,
+  "scenarios": [
+    {
+      "scenario": "goalward",
+      "center_step": 1998,
+      "window": [
+        1923,
+        2073
+      ],
+      "scored": false
+    },
+    {
+      "scenario": "strike",
+      "center_step": 3023,
+      "window": [
+        2948,
+        3098
+      ]
+    },
+    {
+      "scenario": "approach",
+      "center_step": 2152,
+      "window": [
+        2077,
+        2227
+      ]
+    }
+  ],
+  "num_goals_in_rollout": 0,
+  "max_ball_speed": 4.268
+}

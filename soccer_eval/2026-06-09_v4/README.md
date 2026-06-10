@@ -6,6 +6,7 @@
 |---|---|---|---|
 | `lineA_ekf/` | 线A EKF 自定位(EXP13) | `checkpoints/v4_soccer/lineA_ekf_exp13/model_1999.pt` | pos_err median **0.99m** ✅ |
 | `lineB_kick_exp14/` | 线B 踢球技能首训(EXP14) | `checkpoints/v4_soccer/lineB_kick_exp14/model_1999.pt` | pos_err **0.97m**(定位未退化)+ goal_rate 0.08→0.11(训练日志) |
+| `kick_exp16/` | 踢球链最佳基线(越界修复前,EXP16) | `checkpoints/v4_soccer/kick_exp16/model_1999.pt` | 射门率 0.319 + episode_success 0.479(四轮最高);out_of_bounds **0.345**(四轮最差,EXP17-19 修复对象) |
 | `kick_oob_exp19/` | **代表性部署模型**:踢球+越界修复线(EXP19) | `checkpoints/v4_soccer/kick_oob_exp19/model_1999.pt` | 真实射门率 **0.325**(四轮最高)+ out_of_bounds **0.294**(<EXP16 0.345);EXP16-19 综合评分见 `kick_oob_exp19/metrics.json` |
 
 ## 配套方法论文档(repo 根目录)
