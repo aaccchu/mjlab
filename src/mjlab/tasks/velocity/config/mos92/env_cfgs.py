@@ -1811,3 +1811,42 @@ def mos92_soccer_e2e_dualcam_ekf_kick_finish_env_cfg(
   for term in ("soft_boundary", "vel_toward_boundary"):
     cfg.rewards[term].params["corridor_exempt_x"] = True
   return cfg
+
+
+def mos92_soccer_e2e_dualcam_ekf_kick_plant_env_cfg(
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """v4 EXP22: SUPPORT-FOOT PLANT — improve per-touch quality (codex 7.86x lever).
+
+  EXP21 unblocked the finish (SHORT 44.6% -> 23.3%) but the shot rate stalled at
+  ~0.37: episodes still need a median 9 kicks and the freed episodes flowed into
+  NEVER_ARRIVED (17.6% -> 35.2%) — each touch advances the ball too little to
+  cover 10m+ spawns within the 20s budget. codex C21cc measured the strongest
+  single predictor of an effective contact: support_foot_dist <= 0.20 m gives a
+  7.86x lift. This is the human-football fundamental: plant the support foot
+  BESIDE the ball so the swing leg transfers momentum instead of nudging.
+
+  Single new term on top of EXP21's finish env: support_foot_plant — at foot-ball
+  contact steps only, reward exp(-(d_support/0.10)^2) when the support (farther)
+  foot is planted. Contact-gated like kick_impulse so it cannot create a
+  ball-hugging attractor.
+
+  Criteria: kicks/episode (forensics) 9 -> <=6, mid-field kick speed 0.60 ->
+  >=0.75, real shot rate 0.37 -> >=0.42, NEVER_ARRIVED < 28%. Guardrails:
+  fell_over < 0.1 (one-leg planting is a balance stressor!), pos_err < 1.1,
+  OOB <= 0.25, ball_speed_peak > 2.5.
+  """
+  cfg = mos92_soccer_e2e_dualcam_ekf_kick_finish_env_cfg(play=play)
+
+  cfg.rewards["support_plant"] = RewardTermCfg(
+    func=mdp.support_foot_plant,
+    weight=1.5,  # same order as kick_impulse: a contact-quality term.
+    params={
+      "command_name": "dribble",
+      "sensor_name": "foot_ball_contact",
+      "ground_sensor_name": "feet_ground_contact",
+      "std": 0.10,
+      "asset_cfg": SceneEntityCfg("robot", site_names=("left_foot", "right_foot")),
+    },
+  )
+  return cfg
