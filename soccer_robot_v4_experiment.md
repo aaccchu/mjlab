@@ -1225,3 +1225,16 @@ ball_speed_peak 不塌(>2.8,防贴球吸引子)。
 3. WIDE仅6%——EXP20的瞄准修复已基本解决"踢偏",下一杠杆不在瞄准在力度。
 
 工件: soccer_eval/2026-06-10_v4/kick_aim_exp20b/shot_forensics.json(193 episodes + 1817 kicks 全记录)
+
+### SHORT 主败因的机制定位(数值验证,EXP21 的因果依据)
+软边界惩罚在球门走廊内**没有真正豁免**:corridor 只把 hard_x 推到 11.6,软带仍从 11.6−2.0=9.6 起算;
+vel_toward_boundary 把"朝门冲刺(+x)"按"朝边界冲刺"罚。数值算账(走廊内 x=10.3 推球、球速0.4):
+  soft_boundary −0.028 + vel_toward −0.024 + goal_progress +0.016 = **净 −0.036/step**
+对照中场(软带外)推球 = **净 +0.016/step**。
+=> **策略在门口被奖励结构"劝退"**:完美解释近门 kick 速度 0.47<中场 0.69、球到 x=10.5 停住(SHORT)。
+这是 EXP19 强化软边界时引入的副作用,EXP20 的瞄准修复掩盖了它(WIDE 降到 6%),现在它成了头号瓶颈。
+
+**EXP21 设计(单变量,因果修复)**:走廊内(|y|<corridor)豁免软惩罚的 x 分量(y 分量保留防侧滑出界):
+- soft_boundary_penalty: 走廊内 depth_x:=0(只保留 depth_y)
+- velocity_toward_boundary_penalty: 走廊内 v_out_x:=0(只罚 v_out_y)
+判据: SHORT 44.6%→<30%、近门kick速度 0.47→>0.6、射门率 0.368→≥0.42;护栏 OOB≤0.25(走廊豁免可能回吐一点)、fell<0.1、pos_err<1.1。
