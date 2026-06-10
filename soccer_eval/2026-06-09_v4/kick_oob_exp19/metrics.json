@@ -1,0 +1,20 @@
+{
+  "node": "EXP19 — e2e EKF kick + OOB fix + strong soft-boundary shaping",
+  "selected_as": "representative deployment model (v4 kick + boundary line)",
+  "source_ckpt": "logs/rsl_rl/mos92_velocity/2026-06-10_04-51-15_spike_v4_e2e_ekf_kick_oob_soft2/model_1999.pt",
+  "window": "stable last-100 logging samples from /tmp/v4_exp19_full.log",
+  "selection_rationale": "Pareto-optimal over EXP16 on the two core dims (shot rate 0.325>0.319 AND out_of_bounds 0.294<0.345); composite 0.681 within noise of EXP16's 0.686 while leading the primary objective. Full 2000-iter run inheriting all fixes (time_out + goal corridor + soft shaping).",
+  "comparison": {
+    "EXP16": {"shot_rate": 0.319, "goal_rate": 0.154, "target_is_goal": 0.483, "episode_success": 0.479, "possession": 478.7, "ball_speed_peak": 2.957, "ball_to_tgt_err": 2.347, "ball_stuck_s": 0.825, "robot_to_ball": 0.914, "fell_over": 0.044, "out_of_bounds": 0.345, "pos_err_m": 0.913, "composite": 0.686},
+    "EXP17": {"shot_rate": 0.288, "goal_rate": 0.149, "target_is_goal": 0.517, "episode_success": 0.434, "possession": 454.4, "ball_speed_peak": 3.203, "ball_to_tgt_err": 2.788, "ball_stuck_s": 1.342, "robot_to_ball": 1.162, "fell_over": 0.048, "out_of_bounds": 0.256, "pos_err_m": 0.927, "composite": 0.380},
+    "EXP18": {"shot_rate": 0.313, "goal_rate": 0.166, "target_is_goal": 0.530, "episode_success": 0.409, "possession": 413.1, "ball_speed_peak": 3.291, "ball_to_tgt_err": 2.796, "ball_stuck_s": 1.463, "robot_to_ball": 1.228, "fell_over": 0.087, "out_of_bounds": 0.292, "pos_err_m": 0.964, "composite": 0.409, "note": "stopped early at iter~1093 (weights diagnosed too weak); last-100 window"},
+    "EXP19": {"shot_rate": 0.325, "goal_rate": 0.173, "target_is_goal": 0.531, "episode_success": 0.449, "possession": 454.2, "ball_speed_peak": 3.181, "ball_to_tgt_err": 2.765, "ball_stuck_s": 1.335, "robot_to_ball": 1.069, "fell_over": 0.063, "out_of_bounds": 0.294, "pos_err_m": 0.964, "composite": 0.681}
+  },
+  "composite_weights": {"shot_rate": 0.30, "goal_rate": 0.12, "fell_over": 0.13, "out_of_bounds": 0.12, "episode_success": 0.10, "pos_err_m": 0.08, "ball_speed_peak": 0.05, "ball_to_tgt_err": 0.05, "robot_to_ball": 0.05},
+  "ranking": ["EXP16 (0.686)", "EXP19 (0.681)", "EXP18 (0.409)", "EXP17 (0.380)"],
+  "caveats": [
+    "Numbers are from training stdout (stable last-100 window), NOT a fresh headless play=False eval. Per the existing eval methodology note, episode-level metrics (shot_rate/goal_rate/episode_success) are reliable as trends across the 4 runs computed identically, but absolute values are best-read from training logs.",
+    "fell_over startup transient (init_at_random_ep_len) inflates the first ~50 iters to 3-6; the last-100 window excludes it.",
+    "out_of_bounds 0.294 is the post-time_out-fix structural floor (goal_line_x==half_length==11.0, margin 0.3m); reward shaping cannot push it lower without hurting scoring."
+  ]
+}
