@@ -1114,3 +1114,43 @@ EXP19 把软边界权重提到 goal_progress 量级(soft_boundary −2.0、vel_t
 
 **结论**:后期**需要**的是 ①自动化课程 + ②持续域随机化(为 sim-to-real),**不需要** ③在线终身学习
 (至少在拿到稳定 sim 策略前不需要,且风险大于收益)。优先把课程自动化,把"难度随能力提升"做进训练循环。
+
+## EXP20 调研与瓶颈诊断(2026-06-10,开工前充分调研)
+
+### 调研来源
+① 复盘我方 EXP13-19 全部数字+方法论文档"未打的牌" ② 通读 codex v4 工作(只读
+/media/server625/data/AC/Robot/mjlab_codex_v4,~30个踢球链子实验+上界探针方法论) ③ 真实相机渲染实验亲自验证。
+
+### 瓶颈钉死:踢得不准,且有一个被验证的视觉几何 bug
+**指标组合诊断**(按 v4评估指标详解 §四规则):射门率0.32 + ball_speed_peak 3.2 + ball_to_tgt 2.7 +
+robot_to_ball 1.0 → **"会踢但不瞄准/不稳定"**(排除不会踢/追不上/抱球)。症状链:大力踢→落点散→球飞远
+→追球(robot_to_ball↑)→球停(ball_stuck↑)/出界。四轮 reward 调法都没破 0.32 平台。
+
+**决定性 bug(实测验证,codex EXP7C3 同款)**:`_gaze_uv_visible`(rewards.py)垂直项
+`v_ang = elev − neck_pitch`,但真实相机几何实测:**正 neck_pitch = 低头**(neck_pitch +0.2/+0.4/+0.6 时
+地面球才进入画面,center_row 70→59→48;负值全不可见)。地面球 elev≈−0.51,该奖励驱动 neck_pitch→−0.5
+(抬头)——**gaze 奖励一直在教"球在近处时抬头"**,方向整反。受影响消费者:gaze_center / gaze_search /
+search_freeze / ball_gaze_uv(4处)。实测 EXP16 策略 neck_pitch 仅 [−0.194, +0.020](被推错方向)。
+codex 修复同款 bug 后 seg_visible 0.015→0.254、cmd_valid 0.095→0.434。
+
+**第二抑制因素**:pose 奖励 neck_pitch std 仍 0.1/0.15(强拉回0);neck_yaw 早放开到 1.5。
+即使修好 gaze,低头也会被 pose 拽回——必须一起放开。
+
+**第三杠杆(codex C21l2 实测 13×)**:横向对齐。触球时 |y_b|(球在基座系侧向偏移)大 → 踢出方向散。
+codex 仅加 vy∝y_b 对齐项,contact_window 0.0024→0.031(13×)。我方方法论清单(kick_research §四)
+本就列了"横向对齐:惩罚|y_b|把球摆正脚前——候选后续",一直没打。
+
+### codex 其他高价值借鉴(已记,本轮不全做)
+- 上界探针方法论:GT-command 物理上界 goal≈0.16/千步窗——episode 时长本身压射门率;后续值得给我方
+  环境跑同款探针,校准 0.5-0.6 目标的物理可达性。
+- 训练日志会撒谎/多 seed 纪律/mean-policy 口径——判读时警惕。
+- "低速贴球吸引子":普通 PPO 微调 50-200 iter 可洗掉踢球链——EXP20 不重开 std,盯 ball_speed_peak 不掉。
+
+### EXP20 设计(假设:修视觉几何 + 放开低头 + 摆正再踢 → 射门变准)
+1. **修 gaze pitch 符号**(全局 bug 修复):`v_ang = elev + neck_pitch`。
+2. **放开 neck_pitch**(EXP20 env 内 pose std →1.0),低头不再被 pose 奖励拽回。
+3. **新增横向对齐奖励** kick_lateral_alignment:球在身前 x_b∈[0.15,1.0]m 时,奖励 |y_b|→0(exp 核)。
+**bootstrap**:EXP19 model_1999(代表性部署模型,无 std 重开——防"贴球吸引子"洗踢球链)。
+**判据**:真实射门率 0.32→**≥0.40**;辅证 ball_in_view 近距占比↑、neck_pitch 使用范围向正(低头)扩展。
+**护栏**:fell_over<0.1、pos_err<1.1(重点盯:低头↔看地标有张力,若 pos_err 破1.1 → gaze 权重回调)、
+ball_speed_peak 不塌(>2.8,防贴球吸引子)。
