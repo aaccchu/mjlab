@@ -1238,3 +1238,28 @@ vel_toward_boundary 把"朝门冲刺(+x)"按"朝边界冲刺"罚。数值算账(
 - soft_boundary_penalty: 走廊内 depth_x:=0(只保留 depth_y)
 - velocity_toward_boundary_penalty: 走廊内 v_out_x:=0(只罚 v_out_y)
 判据: SHORT 44.6%→<30%、近门kick速度 0.47→>0.6、射门率 0.368→≥0.42;护栏 OOB≤0.25(走廊豁免可能回吐一点)、fell<0.1、pos_err<1.1。
+
+## codex_v4 近期工作调研(2026-06-10,后台agent调研,详见其实验log)
+codex 自 2026-06-10 起全面暂停训练转机制审计(他们的闭环始终 goal=0)。对我们的可用情报:
+
+**互证我们的方向**:
+1. codex C21av/aw 失败桶分解:foot_geometry_miss 主因是**前向距离**(正例 nearest_dx_q90≈0.31m,
+   失败中位0.62-0.83m)——与我们 EXP20 kick_lateral_align(横向)互补,提示**纵向逼近距离**是下一细化维度。
+2. codex C21bz:goalward 触球的命令显著偏**横向**(cmd_cross_ball 0.293 vs 0.120)——"切球"而非"直推",
+   与我们近门轻推的发现一致:好的射门是侧向切击,不是正面顶。
+3. codex C21cc:support_foot_dist≤0.20m 给 **7.86x** lift——支撑脚位置是触球质量的最强单一预测子。
+   我们尚无支撑脚相关 shaping,这是 EXP22+ 候选杠杆。
+
+**反直觉教训(立刻可用)**:
+- "有效触球发生在球不可见时"(codex R2: current_visible 的 next_effective=0)——与我们 1.25m 盲区发现
+  完全一致,他们数据上也证明近脚阶段靠 memory 不靠当前帧。**不要试图让策略踢球时看球**。
+- 放宽触发=毒数据(覆盖65→372行,精度35%→6%):做 dense shaping 时门槛宁严勿松。
+- controlled-reset 域差陷阱:几何摆位复现不了成功踢球(成败取决于支撑相位/摆动脚状态)——
+  我们若做"近门定点射门课程"要警惕同一陷阱(spawn出来的局面≠自然带球到达的局面)。
+- 止损纪律:每方向最多一次机制探针+一次失败审计。
+
+**他们的“真纯视觉”进展(对我们路线A有参考)**:
+deployable belief vs privileged GT 双轨:R2b ball-belief 字段(pos/vel/conf/age/near_foot_prob)
+已接入 runtime(一致性diff<1.3e-7)。核心缺口:GT contact 窗口 96.1% 被 belief 漏掉、
+ball age q50 3.3-4.1s——近脚盲区的 stale memory 是主敌。结论:**去 oracle 时近脚环节的
+ball-belief 时效性是头号难题**,我们设计真纯视觉路线时要把"盲区期间的球状态外推"列为一等公民。
