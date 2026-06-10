@@ -1,11 +1,15 @@
 {
   "ckpt": "checkpoints/v4_soccer/kick_oob_exp19/model_1999.pt",
   "video": "soccer_eval/2026-06-09_v4/kick_oob_exp19/kick_oob_exp19_pov_belief.mp4",
-  "episode_len": 930,
+  "episode_len": 1000,
   "scored": false,
   "fps": 30,
-  "final_loc_err_m": 1.417,
-  "mean_loc_err_m": 0.295,
-  "start_coverage": 0.13,
-  "max_coverage": 0.348
+  "final_loc_err_m": 1.107,
+  "mean_loc_err_m": 1.008,
+  "mean_believed_ball_err_m": 0.999,
+  "start_coverage": 0.043,
+  "max_coverage": 0.348,
+  "start_visible_now": 0.0,
+  "start_loc_err_m": 6.201,
+  "note": "believed-ball offset = self-localization error propagated onto the ball (egocentric ball direction is GT; ball perception is implicit in the CNN, no explicit ball-xy output to read)."
 }

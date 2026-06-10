@@ -470,6 +470,7 @@ class FusedPoseBelief(ManagerTermBase):
     self._kp_local = None
     self._K = 0
     self._last_uniq = None
+    self._last_vis_now = None
     self._last_resid = None
     self._last_xy_n = None
 
@@ -481,6 +482,7 @@ class FusedPoseBelief(ManagerTermBase):
     self._kp_local = field_keypoints_3d(env.device)
     self._K = self._kp_local.shape[0]
     self._last_uniq = torch.zeros(env.num_envs, device=env.device)
+    self._last_vis_now = torch.zeros(env.num_envs, device=env.device)
     self._last_resid = torch.zeros(env.num_envs, device=env.device)
 
   def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
@@ -607,6 +609,7 @@ class FusedPoseBelief(ManagerTermBase):
     uniq_frac = ever.sum(1) / float(K)
     # Cache for the active_scan_coverage reward (read, don't recompute geometry).
     self._last_uniq = uniq_frac.detach()
+    self._last_vis_now = vis_now.detach()
     self._last_resid = resid.detach()
     self._last_xy_n = torch.stack([x_n, y_n], dim=-1).detach()  # (B,2) for monitor
     return torch.stack(

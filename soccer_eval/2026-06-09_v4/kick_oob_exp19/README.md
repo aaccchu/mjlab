@@ -17,13 +17,19 @@
 
 ## 产物(机器人视觉 POV + 自定位信念演示)
 由 `scripts/eval_v4_pov_belief_exp19.py`(共用 `scripts/_v4_pov_belief_video.py`)生成,
-完整一个 episode 的三联画(31s,30fps):
-- `kick_oob_exp19_pov_belief.mp4` — 左:机器人头部相机 POV(`head_cam_rgb`,策略 CNN 实际输入);
-  中:俯视球场 GT 位姿(绿)vs 策略融合信念(红 x,即策略消费的 `_last_xy_n`)+ 球(白)+ 目标(黄星),带拖尾;
-  右:定位误差(米)与融合视野覆盖率(uniq_frac)随时间曲线。
-- `pov_belief.json` — episode 统计(是否进球、首/末/均定位误差、起始/最大覆盖率)。
-- **本段叙事**:start_coverage 0.13 → max_coverage 0.35,均定位误差 0.30m(信念全程贴 GT,定位稳)。
-  本段为单 env0 最深带球(12 次尝试未进球,如实标 `scored: false`);进球片段见三段 dribble-arc 的 `*_goalward.mp4`。
+完整一个 episode 的**四联画**(33s,30fps):
+- `kick_oob_exp19_pov_belief.mp4` —
+  1. **RGB POV**(`head_cam_rgb`,自定位 CNN 实际输入);
+  2. **深度 POV**(`head_cam` 深度,球感知 CNN 输入,turbo 伪彩、近处亮);
+  3. **俯视球场**:机器人 GT 位姿(绿)vs EKF 信念(红 x,即策略消费的 `_mu`),**真实球(白)vs 策略相信的球位置(橙菱形,连线示偏差)**+ 目标(黄星),带拖尾;
+  4. **曲线**:定位误差(米)+ 融合视野覆盖率(青)+ 当前帧可见率(浅蓝)随时间。
+- `pov_belief.json` — episode 统计(是否进球、首/末/均定位误差、**相信的球位置平均误差**、起始/最大覆盖率)。
+- **关键说明**:开局必然"盲视"——reset 时 EKF 处于宽先验、相机看不到任何关键点(`start_visible_now=0`、`start_coverage 0.04`),
+  视频**第一帧没有球门、没有关键点**,定位误差高(本段起始 **~6.2m**);随后转身扫视、EKF 收敛、误差下降。
+- **本段叙事**(`scored: false`):起始定位误差 ~6.2m → 收敛,球带到球门附近;
+  本段单 env0 未进球(EXP19 控球率低于 EXP16,单环境进球偶发,如实标注);进球片段见三段 dribble-arc 的 `*_goalward.mp4`。
+- **诚实标注**:橙点偏差 = **自定位误差传播到球上**(球的自我朝向向量用的是 GT;球感知隐含在 CNN 里,
+  没有可直接读取的"球坐标估计"输出)。即此偏差反映"我以为我在哪"的误差,不是独立的球感知误差。
 
 ## 核心确证(末100稳态,四轮同法对照)
 - 真实射门率 **0.325**(EXP16-19 最高);out_of_bounds **0.294**(< EXP16 0.345)。
