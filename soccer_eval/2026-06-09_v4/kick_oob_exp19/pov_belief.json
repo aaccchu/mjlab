@@ -2,14 +2,15 @@
   "ckpt": "checkpoints/v4_soccer/kick_oob_exp19/model_1999.pt",
   "video": "soccer_eval/2026-06-09_v4/kick_oob_exp19/kick_oob_exp19_pov_belief.mp4",
   "episode_len": 1000,
-  "scored": false,
+  "scored": true,
   "fps": 30,
-  "final_loc_err_m": 1.107,
-  "mean_loc_err_m": 1.008,
-  "mean_believed_ball_err_m": 0.999,
+  "final_loc_err_m": 1.763,
+  "mean_loc_err_m": 0.887,
+  "mean_believed_ball_err_m": 0.848,
   "start_coverage": 0.043,
-  "max_coverage": 0.348,
+  "max_coverage": 0.391,
   "start_visible_now": 0.0,
-  "start_loc_err_m": 6.201,
-  "note": "believed-ball offset = self-localization error propagated onto the ball (egocentric ball direction is GT; ball perception is implicit in the CNN, no explicit ball-xy output to read)."
+  "start_loc_err_m": 2.155,
+  "ball_in_view_frac": 0.676,
+  "note": "believed-ball offset = self-localization error propagated onto the ball (egocentric ball direction is GT; ball perception is implicit in the CNN, no explicit ball-xy output to read). ball_in_view_frac = fraction of steps the ball is inside the head-cam frustum; a ground ball only enters view beyond ~1.25 m (cam ~0.79 m high, ~0 deg pitch), so when dribbling/kicking (ball <1.25 m) it sits in the foot-zone blind spot and the policy relies on the EKF self-pose + RGB temporal memory, not the live ball pixels."
 }

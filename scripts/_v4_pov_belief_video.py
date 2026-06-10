@@ -58,6 +58,13 @@ FPS = 30
 MAX_EPISODE_STEPS = 1000  # 20 s cap (episode resets earlier on goal/fall).
 MAX_ATTEMPTS = 22  # episodes to try before keeping the best goalward attempt.
 TRAIL = 40  # trail length in steps for the top-down map.
+DEPTH_CUTOFF = 3.0  # metres; matches camera_depth obs the policy consumes.
+DEPTH_MIN = 0.05
+# Head-cam geometry (measured from the compiled model): the ball CNN sees a
+# ground ball only beyond this range; closer is the foot-zone blind spot.
+CAM_FOVY_DEG = 60.0
+CAM_HEIGHT = 0.79  # approx head-cam height (m).
+BALL_Z = 0.07
 
 
 def _find_belief_term(env: ManagerBasedRlEnv):
@@ -113,10 +120,42 @@ def _believed_ball(env, belief, cmd, robot, origin_xy):
   return (float(ball_w[0]), float(ball_w[1])), (float(bel[0]), float(bel[1]))
 
 
+def _ball_in_camera(env, cmd, robot):
+  """True if the ball center projects inside the head camera's view frustum this
+  step, plus the robot->ball ground distance. Uses the live camera world pose
+  (cam_xpos / cam_xmat) and the camera's fovy, so it reflects the ACTUAL geometry
+  (head height ~0.79 m, ~0 deg pitch) — a ground ball only enters view beyond
+  ~1.25 m; closer is the foot-zone blind spot."""
+  import mujoco
+
+  m = env.sim.mj_model
+  cam_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_CAMERA, "head_cam")
+  wd = env.sim.wp_data
+  cam_pos = wd.cam_xpos.numpy()[0][cam_id]  # (3,)
+  cam_mat = wd.cam_xmat.numpy()[0][cam_id].reshape(3, 3)
+  ball_w = cmd.ball_pos_w[0].cpu().numpy()
+  rob_w = robot.data.root_link_pos_w[0].cpu().numpy()
+  dist = float(np.hypot(ball_w[0] - rob_w[0], ball_w[1] - rob_w[1]))
+  # Ball center in camera frame (mujoco camera looks down its -z axis).
+  rel = ball_w - cam_pos
+  cam = cam_mat.T @ rel
+  depth = -cam[2]
+  if depth <= 0:  # behind camera
+    return False, dist
+  aspect = 96.0 / 72.0  # rgb cam width/height
+  half_v = math.radians(CAM_FOVY_DEG) / 2.0
+  half_h = math.atan(math.tan(half_v) * aspect)
+  ang_v = math.atan2(cam[1], depth)
+  ang_h = math.atan2(cam[0], depth)
+  in_view = abs(ang_v) < half_v and abs(ang_h) < half_h
+  return bool(in_view), dist
+
+
 def _capture_episode(env, env_w, policy, belief, rgb_s, depth_s, cmd, robot, origin):
   """Roll one episode (until reset or cap). Return per-step trace + frames."""
   tr = {k: [] for k in (
-    "rgb", "depth", "gt", "est", "ball", "ball_bel", "tgt", "err", "cover", "vis"
+    "rgb", "depth", "gt", "est", "ball", "ball_bel", "tgt", "err", "cover", "vis",
+    "ball_in_view", "ball_dist"
   )}
   scored = False
   obs = env_w.get_observations()
@@ -128,7 +167,20 @@ def _capture_episode(env, env_w, policy, belief, rgb_s, depth_s, cmd, robot, ori
     rgb_s.update(0.0)
     depth_s.update(0.0)
     tr["rgb"].append(np.asarray(rgb_s.data.rgb[0].cpu().numpy()))
-    tr["depth"].append(np.asarray(depth_s.data.depth[0, ..., 0].cpu().numpy()))
+    # Clip to the same 3 m the policy's camera_depth obs uses, then normalize —
+    # the RAW sensor depth runs to the ~1000 m horizon, which auto-normalizes the
+    # useful near range (ball / goal at 0-3 m) into near-black. This panel must
+    # show what the policy's ball CNN actually consumes, not the raw buffer.
+    raw_depth = depth_s.data.depth[0, ..., 0].cpu().numpy()
+    clipped = np.clip(raw_depth, DEPTH_MIN, DEPTH_CUTOFF) / DEPTH_CUTOFF
+    tr["depth"].append(np.asarray(clipped))
+
+    # Is the ball within the head camera's view frustum this step? (geometry:
+    # cam ~0.79 m high, ~0 deg pitch, fovy 60 deg -> a ground ball only enters
+    # view beyond ~1.25 m; closer than that it is in the foot-zone blind spot.)
+    bview, bdist = _ball_in_camera(env, cmd, robot)
+    tr["ball_in_view"].append(bview)
+    tr["ball_dist"].append(bdist)
 
     gt = robot_field_pose(env, "dribble")[0]
     gx, gy = float(gt[0]) * HALF_LENGTH, float(gt[1]) * HALF_WIDTH
@@ -208,15 +260,26 @@ def _compose(ep: dict, out_path: Path, title: str) -> None:
       tag = f"localized (loc err {e:.1f} m)"
     fig.suptitle(f"{title}   step {t}/{n}   [{tag}]", fontsize=11)
 
+    ball_in_view = ep["ball_in_view"]
+    ball_dist = ep["ball_dist"]
+    bview = ball_in_view[t]
+    bdist = ball_dist[t]
+    vtag = "ball IN VIEW" if bview else "ball in BLIND SPOT"
+    vcolor = "lime" if bview else "red"
+
     ax1 = fig.add_subplot(1, 4, 1)
     ax1.imshow(ep["rgb"][t])
     ax1.set_title("RGB POV (self-loc CNN)", fontsize=9)
+    ax1.set_xlabel(f"{vtag}  (ball {bdist:.1f} m)", fontsize=8, color=vcolor)
     ax1.set_xticks([])
     ax1.set_yticks([])
 
     ax2 = fig.add_subplot(1, 4, 2)
-    ax2.imshow(ep["depth"][t], cmap="turbo_r")
-    ax2.set_title("depth POV (ball CNN)", fontsize=9)
+    # clipped-to-3m depth (what the policy's camera_depth obs feeds the ball CNN);
+    # near = bright. turbo over [0,1] where 1.0 == 3 m+.
+    ax2.imshow(ep["depth"][t], cmap="turbo_r", vmin=0.0, vmax=1.0)
+    ax2.set_title("depth POV (ball CNN, clip 3m)", fontsize=9)
+    ax2.set_xlabel("near=bright, far(>=3m)=dark", fontsize=8)
     ax2.set_xticks([])
     ax2.set_yticks([])
 
@@ -343,10 +406,15 @@ def run(env_cfg_fn, ckpt: Path, out_dir: Path, prefix: str, title: str) -> dict:
     "max_coverage": round(float(np.max(best["cover"])), 3),
     "start_visible_now": round(float(best["vis"][0]), 3),
     "start_loc_err_m": round(float(np.mean(best["err"][:10])), 3),
+    "ball_in_view_frac": round(float(np.mean(best["ball_in_view"])), 3),
     "note": (
       "believed-ball offset = self-localization error propagated onto the ball "
       "(egocentric ball direction is GT; ball perception is implicit in the CNN, "
-      "no explicit ball-xy output to read)."
+      "no explicit ball-xy output to read). ball_in_view_frac = fraction of steps "
+      "the ball is inside the head-cam frustum; a ground ball only enters view "
+      "beyond ~1.25 m (cam ~0.79 m high, ~0 deg pitch), so when dribbling/kicking "
+      "(ball <1.25 m) it sits in the foot-zone blind spot and the policy relies on "
+      "the EKF self-pose + RGB temporal memory, not the live ball pixels."
     ),
   }
   print(f"[INFO] wrote POV+belief video -> {out_path} (scored={best['scored']})")
