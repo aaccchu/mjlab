@@ -1845,7 +1845,7 @@ def mos92_soccer_e2e_dualcam_ekf_kick_plant_env_cfg(
       "command_name": "dribble",
       "sensor_name": "foot_ball_contact",
       "ground_sensor_name": "feet_ground_contact",
-      "std": 0.10,
+      "std": 0.15,  # e^-(0.3/0.15)^2~0.018: gradient alive at the policy's 0.27m
       "asset_cfg": SceneEntityCfg("robot", site_names=("left_foot", "right_foot")),
     },
   )

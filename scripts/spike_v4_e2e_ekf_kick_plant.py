@@ -87,11 +87,11 @@ def main() -> None:
   max_iter = 8 if smoke else MAX_ITER
   agent_cfg = mos92_selfloc_vision_ppo_runner_cfg()
   agent_cfg.max_iterations = max_iter
-  agent_cfg.run_name = "spike_v4_e2e_ekf_kick_plant"
+  agent_cfg.run_name = "spike_v4_e2e_ekf_kick_plant_b"
   agent_cfg.save_interval = 100
 
   log_root = Path("logs/rsl_rl") / agent_cfg.experiment_name
-  stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_spike_v4_e2e_ekf_kick_plant")
+  stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_spike_v4_e2e_ekf_kick_plant_b")
   log_dir = log_root / stamp
   log_dir.mkdir(parents=True, exist_ok=True)
 
