@@ -1288,3 +1288,12 @@ oob **0.185-0.21**(更优)、fell 0.071、pos_err 0.91、peak 2.81(守住)。
 **下一步 EXP22(codex 7.86x杠杆)**: support-foot 接触质量shaping——codex C21cc 测得
 support_foot_dist≤0.20m 给 7.86x effective-contact lift(他们最强单一预测子)。
 对症"每脚质量":支撑脚贴近球的瞬间踢球,力量传递充分(人类足球的"支撑脚站位"基本功)。
+
+### EXP22 中止判读(iter~935,plant信号太稀疏无效,提前止损)
+support_foot_plant 接触门控太严:Episode_Reward/support_plant≈0.0003(比 kick_impulse 0.011 还小 40 倍,
+比 goal_progress 0.30 小 1000 倍),support_dist_at_kick 在 0.25-0.27 平台不降——**塑形信号约等于零**。
+中途射门率一度 0.402(末100@iter630)但回 0.39,与 EXP21 同带宽;oob 0.16-0.20 续创新低(继承效应)。
+**根因(与 EXP18 同型教训)**:接触瞬间(~1% 步)× exp(-(d/0.1)²) 在 d~0.27 时≈e^-7.3≈0.0007 → 双重稀疏,
+梯度无法把 27cm 拉向 10cm(中间没有奖励坡)。**修法应给"接近触球时"的支撑脚位置塑形(预接触窗口,
+codex pre_contact_window 6.03x 也是这么定义的),而非只在接触帧**。
+**决定**:止损(同 EXP18 纪律:诊断完成即停),省下 1000 iter。EXP22b=预接触窗口版 plant。
