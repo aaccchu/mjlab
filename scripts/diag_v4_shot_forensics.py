@@ -37,16 +37,18 @@ import torch
 
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import MjlabOnPolicyRunner, RslRlVecEnvWrapper
-from mjlab.tasks.velocity.config.mos92.env_cfgs import (
-  mos92_soccer_e2e_dualcam_ekf_kick_aim_env_cfg,
-)
 from mjlab.tasks.velocity.config.mos92.rl_cfg import (
   mos92_selfloc_vision_ppo_runner_cfg,
 )
 from mjlab.utils.torch import configure_torch_backends
 
+# Defaults; override with --ckpt/--out/--env. NEVER copy-edit this script with
+# sed to retarget it — a silent no-match ran EXP20b weights as "EXP22b
+# forensics" (caught by codex audit 2026-06-11). The JSON "ckpt" field is the
+# ground truth of what was measured; always cross-check it before quoting.
 CKPT = Path("checkpoints/v4_soccer/kick_aim_exp20b/model_1999.pt")
 OUT = Path("soccer_eval/2026-06-10_v4/kick_aim_exp20b/shot_forensics.json")
+ENV_NAME = "mos92_soccer_e2e_dualcam_ekf_kick_aim_env_cfg"
 GOAL_X = 11.0
 GOAL_HALF_W = 1.0
 NEAR_GOAL_X = 7.0  # near-goal zone: x > 7 (attacking third-ish)
@@ -57,14 +59,25 @@ def main() -> None:
   configure_torch_backends()
   num_envs = 64
   steps = 3000  # ~3 episodes per env -> ~190 episode records
+  ckpt, out, env_name = CKPT, OUT, ENV_NAME
   for i, a in enumerate(sys.argv):
     if a == "--envs":
       num_envs = int(sys.argv[i + 1])
     if a == "--steps":
       steps = int(sys.argv[i + 1])
+    if a == "--ckpt":
+      ckpt = Path(sys.argv[i + 1])
+    if a == "--out":
+      out = Path(sys.argv[i + 1])
+    if a == "--env":
+      env_name = sys.argv[i + 1]
+  assert ckpt.exists(), f"ckpt missing: {ckpt}"
+  import mjlab.tasks.velocity.config.mos92.env_cfgs as _cfgs
+  env_cfg_fn = getattr(_cfgs, env_name)
+  print(f"[INFO] forensics target: ckpt={ckpt} env={env_name} out={out}")
   device = "cuda:0"
 
-  env_cfg = mos92_soccer_e2e_dualcam_ekf_kick_aim_env_cfg(play=False)
+  env_cfg = env_cfg_fn(play=False)
   env_cfg.scene.num_envs = num_envs
   env_cfg.observations["actor"].enable_corruption = False
   env_cfg.events.pop("push_robot", None)
@@ -78,7 +91,7 @@ def main() -> None:
   env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
   env_w = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
   runner = MjlabOnPolicyRunner(env_w, asdict(agent_cfg), "/tmp", device)
-  runner.load(str(CKPT), load_cfg={"actor": True}, strict=False, map_location=device)
+  runner.load(str(ckpt), load_cfg={"actor": True}, strict=False, map_location=device)
   policy = runner.get_inference_policy(device=device)
 
   cmd = env.command_manager.get_term("dribble")
@@ -112,7 +125,7 @@ def main() -> None:
   rl = robot.data.root_link_pos_w[:, :2] - origin
   spawn_goal_dist[:] = ((rl[:, 0] - GOAL_X) ** 2 + rl[:, 1] ** 2).sqrt()
 
-  print(f"[INFO] forensics rollout: {B} envs x {steps} steps from {CKPT.name}")
+  print(f"[INFO] forensics rollout: {B} envs x {steps} steps from {ckpt.name}")
   for t in range(steps):
     with torch.no_grad():
       a = policy(obs)
@@ -233,16 +246,16 @@ def main() -> None:
   print("\n-- WIDE misses: |y| at end line --")
   print("  ", stats([abs(e["y_at_deep"]) for e in episodes if e["miss_type"] == "WIDE"]))
 
-  OUT.parent.mkdir(parents=True, exist_ok=True)
-  OUT.write_text(json.dumps({
-    "ckpt": str(CKPT), "episodes": episodes,
+  out.parent.mkdir(parents=True, exist_ok=True)
+  out.write_text(json.dumps({
+    "ckpt": str(ckpt), "episodes": episodes,
     "kicks": kick_records[:2000],  # cap file size
     "summary": {
       "n_episodes": n, "scored": len(sc), "rate": round(len(sc) / max(n, 1), 3),
       "miss_types": dict(mt),
     },
   }, indent=1))
-  print(f"\n[INFO] full records -> {OUT}")
+  print(f"\n[INFO] full records -> {out}")
 
 
 if __name__ == "__main__":

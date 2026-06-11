@@ -1352,3 +1352,34 @@ fell 0.059、oob 0.20-0.22(守住)。ball_speed_peak 2.62-2.69(缓降但>2.5护�
   ball-belief显式化,每阶段判据/风险/文件已列),等当前框架性能榨干后启动阶段1。
 
 **模型**: checkpoints/v4_soccer/kick_plant_exp22b/(已归档+验证可加载)。
+
+## ⚠️ EXP22b forensics 测量错误更正(2026-06-11,codex 审计发现)
+**错误**: 此前"EXP22b forensics"实际跑的是 EXP20b 权重——制作 /tmp/diag_exp22b.py 时 sed 替换模式
+写错(用了 EXP21 的路径模式,源脚本硬编码的是 kick_aim_exp20b),**静默不匹配**,CKPT 没被替换。
+json 的 ckpt 字段忠实记录了真相(kick_aim_exp20b),被 codex 审计抓出。
+
+**用归档 kick_plant_exp22b/model_1999.pt 重跑的真实 forensics(192 episodes)**:
+| | EXP20b | EXP21 | 真EXP22b |
+|---|---|---|---|
+| SCORED | 31.6% | 34.2% | **28.6%** |
+| SHORT | 44.6% | 23.3% | 30.7% |
+| NEVER_ARRIVED | 17.6% | 35.2% | **36.5%** |
+| 中场球速中位 | 0.69 | 0.60 | **0.57** |
+| 近门球速中位 | 0.47 | 0.52 | **0.42** |
+
+**作废的结论**: "SCORED三轮连升31.6→34.2→37.0"、"EXP22b中场球速0.73达标解决到达问题
+(NEVER_ARRIVED 35%→17%)"。这些数字来自 EXP20b 权重的重复测量。
+**仍然有效的**: 训练日志口径的射门率 0.395-0.416(直接读训练log,与forensics无关);
+EXP21 的 forensics(diag_exp21.py 的 sed 模式当时匹配成功,json ckpt 字段已核实指向 kick_finish)。
+
+**修正后的真实图景**:
+- forensics 口径下 EXP22b(0.286)**未优于** EXP21(0.342),甚至可能略差(1.7σ,未决定性)。
+- 训练口径(0.395-0.416) vs forensics 口径(0.286)的缺口拉大,可能因素: 训练含 50% 随机点
+  episode 的混合分布、64env评估的样本噪声、plant reward 对评估行为无影响但训练分布有shift。
+- **EXP22b"窗口最佳"的地位现在存疑**,需要更大样本的 EXP21 vs EXP22b 对决(或直接看 EXP23,
+  它从 EXP22b 续训,若 EXP23 forensics 同样疲软则回退到 EXP21 谱系)。
+- EXP23 的设计前提("近门发力弱")在真数据下**更加成立**(近门球速 0.42 比误测的 0.50 还低),
+  方向不变。
+
+**防再犯(已固化)**: diag_v4_shot_forensics.py 改为 --ckpt/--env/--out 参数化,脚本头部写明
+"禁止 sed 复制改造;json 的 ckpt 字段是测量对象的唯一真相,引用结论前必须核对"。
