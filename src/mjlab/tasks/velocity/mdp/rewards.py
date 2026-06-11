@@ -542,6 +542,8 @@ def dribble_kick_impulse(
   sensor_name: str,
   command_name: str,
   speed_threshold: float = 0.0,
+  near_goal_gain: float = 1.0,
+  near_goal_x: float = 9.0,
 ) -> torch.Tensor:
   """v4 line-B B2: reward the QUALITY of a foot-ball kick, not just that contact
   happened. At a foot-ball contact step, reward the ball speed projected onto the
@@ -557,6 +559,15 @@ def dribble_kick_impulse(
   (continuous contact pays more in integral than one hard strike that leaves the
   foot). EXP14 plateaued at goal_rate~0.11 with ball_speed stuck ~0.39 — the classic
   symptom. Setting the threshold above the nudge speed forces a real strike to score.
+
+  near_goal_gain (v4 EXP23): multiply the reward by this factor when the ball is
+  past near_goal_x — the "临门一脚" zone. EXP20b-22b forensics: near-goal kick
+  speed sat at 0.47-0.52 across three rounds (mid-field 0.73) and SHORT misses
+  dominate; tiny nudges in the mouth earn steady goal_progress while a real
+  strike risks falling/OOB, so the policy settles into timid finishing. The gain
+  multiplies the kick-vs-nudge reward GAP near the goal (x3: 0.045 -> 0.135 per
+  contact) so one decisive strike finally outbids ten nudges. threshold is NOT
+  raised (EXP15 lesson: a too-high gate starves the signal entirely).
   """
   contact_sensor: ContactSensor = env.scene[sensor_name]
   data = contact_sensor.data
@@ -580,6 +591,14 @@ def dribble_kick_impulse(
   projected = torch.where(
     projected > speed_threshold, projected, torch.zeros_like(projected)
   )
+  if near_goal_gain != 1.0:
+    ball_local_x = ball_xy[:, 0] - center_xy[:, 0]
+    gain = torch.where(
+      ball_local_x > near_goal_x,
+      torch.full_like(projected, near_goal_gain),
+      torch.ones_like(projected),
+    )
+    projected = projected * gain
   return in_contact * projected
 
 

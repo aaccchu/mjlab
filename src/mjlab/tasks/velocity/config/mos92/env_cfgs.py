@@ -1850,3 +1850,34 @@ def mos92_soccer_e2e_dualcam_ekf_kick_plant_env_cfg(
     },
   )
   return cfg
+
+
+def mos92_soccer_e2e_dualcam_ekf_kick_strike_env_cfg(
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """v4 EXP23: NEAR-GOAL STRIKE GAIN — make one decisive finish outbid ten nudges.
+
+  Three rounds (EXP20b/21/22b) pinned the stubborn bottleneck: near-goal (x>7)
+  kick speed stuck at 0.47-0.52 while mid-field hits 0.73; kicks/episode stuck
+  at 9; SHORT misses dominate again (40.6%) once arrival was fixed. EXP21 proved
+  it is NOT a penalty-structure problem (corridor already exempt). It is a skill
+  local optimum: in the mouth, tiny nudges earn steady goal_progress with zero
+  fall/OOB risk, while a real strike risks both. The expected-value gap per
+  contact (1.5 * dv * dt ~ 0.045) is too small to justify the risk.
+
+  Single-variable fix: near_goal_gain=3.0 on dribble_kick_impulse for ball
+  x > 9 — triples the kick-vs-nudge reward GAP exactly where finishing happens
+  (0.045 -> 0.135/contact, now comparable to the risk cost). speed_threshold
+  stays 0.3 (EXP15 lesson: raising the gate starves the signal; the gain shifts
+  the optimum instead of gating).
+
+  Criteria: near-goal kick speed 0.50 -> >=0.65, SHORT 40.6% -> <30%, real shot
+  rate 0.40-0.42 -> >=0.45. Guardrails: fell_over < 0.1 (striking is riskier!),
+  OOB <= 0.25, pos_err < 1.1, ball_speed_peak >= 2.6 (watch the three-round
+  slow decline 2.82->2.70->2.65 — this experiment should REVERSE it).
+  """
+  cfg = mos92_soccer_e2e_dualcam_ekf_kick_plant_env_cfg(play=play)
+
+  cfg.rewards["kick_impulse"].params["near_goal_gain"] = 3.0
+  cfg.rewards["kick_impulse"].params["near_goal_x"] = 9.0
+  return cfg
