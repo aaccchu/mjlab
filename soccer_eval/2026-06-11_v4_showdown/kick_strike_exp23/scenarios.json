@@ -1,0 +1,35 @@
+{
+  "ckpt": "checkpoints/v4_soccer/kick_strike_exp23/model_1999.pt",
+  "rollout_steps": 4000,
+  "fps": 50,
+  "clip_len_steps": 150,
+  "scenarios": [
+    {
+      "scenario": "goalward",
+      "center_step": 3921,
+      "window": [
+        3846,
+        3996
+      ],
+      "scored": false
+    },
+    {
+      "scenario": "strike",
+      "center_step": 3519,
+      "window": [
+        3444,
+        3594
+      ]
+    },
+    {
+      "scenario": "approach",
+      "center_step": 3722,
+      "window": [
+        3647,
+        3797
+      ]
+    }
+  ],
+  "num_goals_in_rollout": 1,
+  "max_ball_speed": 2.369
+}

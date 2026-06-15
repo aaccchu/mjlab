@@ -1,0 +1,15 @@
+{
+  "ckpt": "checkpoints/v4_soccer/kick_strike_exp23/model_1999.pt",
+  "video": "soccer_eval/2026-06-11_v4_showdown/kick_strike_exp23/kick_strike_exp23_pov_belief.mp4",
+  "episode_len": 1000,
+  "scored": true,
+  "fps": 30,
+  "final_loc_err_m": 2.03,
+  "mean_loc_err_m": 0.834,
+  "start_loc_err_m": 4.697,
+  "ball_in_view_frac": 0.443,
+  "first_ball_sighting_step": 63,
+  "num_kicks": 16,
+  "robot_distance_m": 9.64,
+  "note": "NO explicit ball estimate exists: ball info is implicit in the camera CNN (depth + 6-frame RGB stack). The map shows TRUE ball (white) and the LAST CAMERA SIGHTING (cyan) \u2014 ball knowledge begins at first_ball_sighting_step, when the ball first enters the frustum (>~1.25 m; closer is the foot-zone blind spot). neck_pitch is policy-controlled/unlimited but the current policy only pitches ~-11 deg, so it rarely looks fully down at a close ball."
+}

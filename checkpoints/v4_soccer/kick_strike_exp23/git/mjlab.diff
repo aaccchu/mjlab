@@ -1,0 +1,18 @@
+--- git commit ---
+f71f49e6fb18a58f5a01e6a08107c3ed3d8726e4
+
+
+--- git status ---
+位于分支 main
+您的分支领先 'origin/main' 共 64 个提交。
+  （使用 "git push" 来发布您的本地提交）
+
+未跟踪的文件:
+  （使用 "git add <文件>..." 以包含要提交的内容）
+	checkpoints/v4_soccer/kick_strike_exp23/
+	soccer_eval/2026-06-11_v4_showdown/
+
+提交为空，但是存在尚未跟踪的文件（使用 "git add" 建立跟踪）
+
+
+--- git diff ---
