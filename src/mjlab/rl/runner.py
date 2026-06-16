@@ -34,6 +34,9 @@ class MjlabOnPolicyRunner(OnPolicyRunner):
     alg = train_cfg.get("algorithm", {})
     if alg.get("keypoint_cfg") is None:
       alg.pop("keypoint_cfg", None)
+    # Same for amp_cfg: only AMPPPO consumes it (EXP24). None -> plain PPO.
+    if alg.get("amp_cfg") is None:
+      alg.pop("amp_cfg", None)
     super().__init__(env, train_cfg, log_dir, device)
 
   def export_policy_to_onnx(

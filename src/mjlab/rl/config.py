@@ -82,6 +82,10 @@ class RslRlPpoAlgorithmCfg:
   keypoint_cfg: dict[str, Any] | None = None
   """v4 EXP5f: config for KeypointAuxPPO's supervised keypoint aux loss
   (action_start/end slice, label_group, coef, num_keypoints). None for plain PPO."""
+  amp_cfg: dict[str, Any] | None = None
+  """v4 EXP24: config for AMPPPO's adversarial-motion-prior style reward
+  (motion_files, joint_names, amp_obs_terms, discr_hidden_dims, amp_reward_coef,
+  amp_task_reward_lerp, amp_grad_pen_coef, amp_lr_coef, obs_group). None for plain PPO."""
 
 
 @dataclass

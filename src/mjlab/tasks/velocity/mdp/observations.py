@@ -57,6 +57,28 @@ def foot_contact_forces(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tenso
   return torch.sign(forces_flat) * torch.log1p(torch.abs(forces_flat))
 
 
+def joint_pos_abs(
+  env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG
+) -> torch.Tensor:
+  """Absolute joint positions for the selected joints (NOT relative to default).
+
+  Used for the AMP observation group: the MOS9 reference motion clips store
+  absolute joint angles, so the policy's AMP obs must be absolute too for the
+  discriminator to compare like with like. Select/order joints via
+  ``SceneEntityCfg(joint_names=[...], preserve_order=True)``.
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+  return asset.data.joint_pos[:, asset_cfg.joint_ids]
+
+
+def joint_vel_abs(
+  env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG
+) -> torch.Tensor:
+  """Absolute joint velocities for the selected joints (AMP obs group)."""
+  asset: Entity = env.scene[asset_cfg.name]
+  return asset.data.joint_vel[:, asset_cfg.joint_ids]
+
+
 def _dribble_cmd(env: ManagerBasedRlEnv, command_name: str) -> DribbleCommand:
   return cast(DribbleCommand, env.command_manager.get_term(command_name))
 

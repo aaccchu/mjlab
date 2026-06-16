@@ -1881,3 +1881,66 @@ def mos92_soccer_e2e_dualcam_ekf_kick_strike_env_cfg(
   cfg.rewards["kick_impulse"].params["near_goal_gain"] = 3.0
   cfg.rewards["kick_impulse"].params["near_goal_x"] = 9.0
   return cfg
+
+
+# The 18 reference-motion joints (MOS9 AMP dataset order: R-arm, L-arm, R-leg,
+# L-leg; no neck). Verified by scripts/amp/check_motion_dataset.py to resolve by
+# name into the live MOS92 model and to reproduce the clips' body positions via
+# FK to 0 mm — i.e. env and dataset joint state share one convention.
+AMP_JOINT_NAMES: tuple[str, ...] = (
+  "right_shoulder_pitch",
+  "right_shoulder_roll",
+  "right_elbow",
+  "left_shoulder_pitch",
+  "left_shoulder_roll",
+  "left_elbow",
+  "right_hip_pitch",
+  "right_hip_roll",
+  "right_hip_yaw",
+  "right_knee",
+  "right_ankle_pitch",
+  "right_ankle_roll",
+  "left_hip_pitch",
+  "left_hip_roll",
+  "left_hip_yaw",
+  "left_knee",
+  "left_ankle_pitch",
+  "left_ankle_roll",
+)
+
+
+def mos92_soccer_e2e_dualcam_ekf_kick_strike_amp_env_cfg(
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """v4 EXP24: STRIKE + AMP — keep the best shot policy, add a human-like gait.
+
+  Identical to the EXP23 strike env (kick chain, vision, EKF, all rewards and
+  terminations unchanged) plus ONE training-only observation group ``amp`` that
+  feeds the adversarial-motion-prior discriminator (see mjlab.rl.amp_ppo:AMPPPO).
+  The group carries the 18 reference joints' ABSOLUTE positions and velocities
+  (matching the dataset convention); it is NOT placed in the actor/critic obs
+  sets, so the policy never sees it — only the discriminator scores it. Corruption
+  is off so the policy's AMP state is clean like the reference clips.
+
+  The discriminator only adds a per-step style reward; it shares no parameters
+  with the actor/critic. The style/task trade-off lives entirely in
+  ``amp_task_reward_lerp`` (set on the runner side), protecting the shot rate.
+  """
+  cfg = mos92_soccer_e2e_dualcam_ekf_kick_strike_env_cfg(play=play)
+
+  amp_asset = SceneEntityCfg(
+    "robot", joint_names=AMP_JOINT_NAMES, preserve_order=True
+  )
+  cfg.observations["amp"] = ObservationGroupCfg(
+    terms={
+      "joint_pos": ObservationTermCfg(
+        func=mdp.joint_pos_abs, params={"asset_cfg": amp_asset}
+      ),
+      "joint_vel": ObservationTermCfg(
+        func=mdp.joint_vel_abs, params={"asset_cfg": amp_asset}
+      ),
+    },
+    enable_corruption=False,
+    concatenate_terms=True,
+  )
+  return cfg
