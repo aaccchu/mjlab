@@ -1,0 +1,8 @@
+{
+  "ckpt": "checkpoints/v4_soccer/kick_strike_amp_exp24/model_1999.pt",
+  "video": "soccer_eval/2026-06-16_v4_amp/kick_strike_amp_exp24/kick_strike_amp_exp24_long.mp4",
+  "steps": 9000,
+  "fps": 50,
+  "duration_s": 180.0,
+  "goals_in_rollout": 4
+}

@@ -1,0 +1,163 @@
+seed: 42
+num_steps_per_env: 24
+max_iterations: 2000
+obs_groups:
+  actor: !!python/tuple
+  - actor
+  - camera
+  - camera_rgb
+  critic: !!python/tuple
+  - critic
+  amp: !!python/tuple
+  - amp
+save_interval: 100
+experiment_name: mos92_velocity
+run_name: spike_v4_e2e_ekf_kick_strike_amp
+logger: wandb
+wandb_project: mjlab
+wandb_tags: !!python/tuple []
+resume: false
+load_run: .*
+load_checkpoint: model_.*.pt
+clip_actions: null
+upload_model: true
+class_name: OnPolicyRunner
+actor:
+  hidden_dims: !!python/tuple
+  - 512
+  - 256
+  - 128
+  activation: elu
+  obs_normalization: true
+  cnn_cfg:
+    camera:
+      output_channels:
+      - 16
+      - 32
+      kernel_size:
+      - 5
+      - 3
+      stride:
+      - 2
+      - 2
+      padding: zeros
+      activation: elu
+      max_pool: false
+      global_pool: none
+      spatial_softmax: true
+      spatial_softmax_temperature: 1.0
+    camera_rgb:
+      output_channels:
+      - 16
+      - 32
+      kernel_size:
+      - 5
+      - 3
+      stride:
+      - 2
+      - 2
+      padding: zeros
+      activation: elu
+      max_pool: false
+      global_pool: none
+      spatial_softmax: true
+      spatial_softmax_temperature: 1.0
+  distribution_cfg:
+    class_name: GaussianDistribution
+    init_std: 1.0
+    std_type: scalar
+  rnn_type: null
+  rnn_hidden_dim: 256
+  rnn_num_layers: 1
+  class_name: mjlab.rl.spatial_softmax:SpatialSoftmaxCNNModel
+critic:
+  hidden_dims: !!python/tuple
+  - 512
+  - 256
+  - 128
+  activation: elu
+  obs_normalization: true
+  cnn_cfg: null
+  distribution_cfg: null
+  rnn_type: null
+  rnn_hidden_dim: 256
+  rnn_num_layers: 1
+  class_name: MLPModel
+algorithm:
+  num_learning_epochs: 5
+  num_mini_batches: 4
+  learning_rate: 0.001
+  schedule: adaptive
+  gamma: 0.99
+  lam: 0.95
+  entropy_coef: 0.01
+  desired_kl: 0.01
+  max_grad_norm: 1.0
+  value_loss_coef: 1.0
+  use_clipped_value_loss: true
+  clip_param: 0.2
+  normalize_advantage_per_mini_batch: false
+  optimizer: adam
+  share_cnn_encoders: false
+  class_name: mjlab.rl.amp_ppo:AMPPPO
+  keypoint_cfg: null
+  amp_cfg:
+    obs_group: amp
+    joint_names:
+    - right_shoulder_pitch
+    - right_shoulder_roll
+    - right_elbow
+    - left_shoulder_pitch
+    - left_shoulder_roll
+    - left_elbow
+    - right_hip_pitch
+    - right_hip_roll
+    - right_hip_yaw
+    - right_knee
+    - right_ankle_pitch
+    - right_ankle_roll
+    - left_hip_pitch
+    - left_hip_roll
+    - left_hip_yaw
+    - left_knee
+    - left_ankle_pitch
+    - left_ankle_roll
+    amp_obs_terms:
+    - joint_pos
+    - joint_vel
+    motion_files:
+    - docs/robot_param/MOS9-AMP-main/data/motions/mos9_fk_motion/B10_-__Walk_turn_left_45_stageii.npz
+    - docs/robot_param/MOS9-AMP-main/data/motions/mos9_fk_motion/B11_-__Walk_turn_left_135_stageii.npz
+    - docs/robot_param/MOS9-AMP-main/data/motions/mos9_fk_motion/B13_-__Walk_turn_right_90_stageii.npz
+    - docs/robot_param/MOS9-AMP-main/data/motions/mos9_fk_motion/B14_-__Walk_turn_right_45_t2_stageii.npz
+    - docs/robot_param/MOS9-AMP-main/data/motions/mos9_fk_motion/B15_-__Walk_turn_around_stageii.npz
+    - docs/robot_param/MOS9-AMP-main/data/motions/mos9_fk_motion/B22_-__side_step_left_stageii.npz
+    - docs/robot_param/MOS9-AMP-main/data/motions/mos9_fk_motion/B23_-__side_step_right_stageii.npz
+    - docs/robot_param/MOS9-AMP-main/data/motions/mos9_fk_motion/B4_-_Stand_to_Walk_backwards_stageii.npz
+    - docs/robot_param/MOS9-AMP-main/data/motions/mos9_fk_motion/B9_-__Walk_turn_left_90_stageii.npz
+    - docs/robot_param/MOS9-AMP-main/data/motions/mos9_fk_motion/Walk_B10_-_Walk_turn_left_45_stageii.npz
+    - docs/robot_param/MOS9-AMP-main/data/motions/mos9_fk_motion/Walk_B13_-_Walk_turn_right_45_stageii.npz
+    - docs/robot_param/MOS9-AMP-main/data/motions/mos9_fk_motion/Walk_B15_-_Walk_turn_around_stageii.npz
+    - docs/robot_param/MOS9-AMP-main/data/motions/mos9_fk_motion/Walk_B16_-_Walk_turn_change_stageii.npz
+    - docs/robot_param/MOS9-AMP-main/data/motions/mos9_fk_motion/Walk_B22_-_Side_step_left_stageii.npz
+    - docs/robot_param/MOS9-AMP-main/data/motions/mos9_fk_motion/Walk_B23_-_Side_step_right_stageii.npz
+    - docs/robot_param/MOS9-AMP-main/data/motions/mos9_fk_motion/Walk_B4_-_Stand_to_Walk_Back_stageii.npz
+    - docs/robot_param/MOS9-AMP-main/data/motions/mos9_fk_motion_clipped_simple/step_left1.npz
+    - docs/robot_param/MOS9-AMP-main/data/motions/mos9_fk_motion_clipped_simple/step_left1_copy1.npz
+    - docs/robot_param/MOS9-AMP-main/data/motions/mos9_fk_motion_clipped_simple/step_left1_copy2.npz
+    - docs/robot_param/MOS9-AMP-main/data/motions/mos9_fk_motion_clipped_simple/step_left2.npz
+    - docs/robot_param/MOS9-AMP-main/data/motions/mos9_fk_motion_clipped_simple/step_right1.npz
+    - docs/robot_param/MOS9-AMP-main/data/motions/mos9_fk_motion_clipped_simple/step_right1_copy1.npz
+    - docs/robot_param/MOS9-AMP-main/data/motions/mos9_fk_motion_clipped_simple/step_right1_copy2.npz
+    - docs/robot_param/MOS9-AMP-main/data/motions/mos9_fk_motion_clipped_simple/step_right2.npz
+    - docs/robot_param/MOS9-AMP-main/data/motions/mos9_fk_motion_clipped_simple/walk_backwards.npz
+    - docs/robot_param/MOS9-AMP-main/data/motions/mos9_fk_motion_clipped_simple/walk_straight1.npz
+    - docs/robot_param/MOS9-AMP-main/data/motions/mos9_fk_motion_clipped_simple/walk_straight2.npz
+    discr_hidden_dims:
+    - 256
+    - 256
+    amp_reward_coef: 0.2
+    amp_task_reward_lerp: 0.7
+    amp_grad_pen_coef: 10.0
+    amp_lr_coef: 0.1
+    replay_buffer_size: 1000000
